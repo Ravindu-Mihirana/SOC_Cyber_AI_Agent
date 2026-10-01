@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import streamlit as st
 
+from soc_cyber_agent.app_settings import load_app_settings, save_burp_settings
 from soc_cyber_agent.ai_analyzer import AIAnalysisError, analyze_findings
 from soc_cyber_agent.reports import render_html, render_pdf
 from soc_cyber_agent.report_importers import ReportImportError, parse_burp_xml, parse_openvas_xml
@@ -213,11 +214,15 @@ def _new_assessment_page() -> None:
     st.title("Start an assessment")
     st.write("Choose tools, set the target, and review what will run before you start.")
     availability = scanner_availability()
+    burp_settings = load_app_settings()
     with st.container(border=True):
         st.markdown("#### Scanner readiness")
         cols = st.columns(len(SCANNERS))
         for col, name in zip(cols, SCANNERS):
             ready, detail = availability[name]
+            if name == "burp":
+                ready = bool(burp_settings["burp_api_url"] and burp_settings["burp_api_key"])
+                detail = burp_settings["burp_api_url"] if ready else "Configure the REST API in Settings"
             with col:
                 with st.container(border=True):
                     if ready:
@@ -237,11 +242,13 @@ def _new_assessment_page() -> None:
         }
         for index, (col, name) in enumerate(zip(scanner_cols, SCANNERS)):
             ready, _ = availability[name]
+            if name == "burp":
+                ready = bool(burp_settings["burp_api_url"] and burp_settings["burp_api_key"])
             with col:
                 with st.container(border=True):
                     chosen = st.checkbox(name.title(), value=(name == "nmap"), key=f"scan_select_{name}")
                     st.caption(descriptions[name])
-                    st.caption("Ready" if ready else "Tool not detected")
+                    st.caption("Ready" if ready else "Configure in Settings" if name == "burp" else "Tool not detected")
             if chosen:
                 selected.append(name)
         scanners = selected
@@ -249,14 +256,15 @@ def _new_assessment_page() -> None:
         col_nmap, col_web = st.columns(2)
         nmap_target = col_nmap.text_input("Nmap hostname or IP", placeholder="192.0.2.10")
         web_target = col_web.text_input("Web target URL (Burp / Nikto / Gobuster)", placeholder="https://authorized.example")
-        burp_api_url = "http://127.0.0.1:1337"
-        burp_api_key = ""
+        burp_api_url = burp_settings["burp_api_url"]
+        burp_api_key = burp_settings["burp_api_key"]
         burp_profile = "Crawl strategy - fastest"
         if "burp" in scanners:
             with st.expander("Burp Suite connection and scan profile", expanded=True):
-                st.caption("Use Burp's built-in REST API. When the dashboard runs on the Kali VM, keep the service bound to localhost and use this host URL.")
-                burp_api_url = st.text_input("Burp REST API service URL", value=os.environ.get("BURP_API_URL", "http://127.0.0.1:1337"), placeholder="http://127.0.0.1:1337")
-                burp_api_key = st.text_input("Burp REST API key", value=os.environ.get("BURP_API_KEY", ""), type="password", help="Stored only in this Streamlit session. Burp's API key is added to its REST URL path.")
+                if burp_api_key:
+                    st.success(f"Using saved Burp connection · {burp_api_url}")
+                else:
+                    st.warning("Burp connection is not configured. Add its service URL and API key on the Settings page.")
                 burp_profile = st.selectbox("Burp scan profile", ["Crawl strategy - fastest", "Audit checks - light active", "Audit checks - all issues"], help="Audit profiles actively test discovered inputs and can create significant traffic or change target data. Start with the crawl-only profile unless an active audit is approved.")
         scan_type = st.selectbox("Nmap profile", ["quick", "version"], help="Quick scans common ports; version attempts service detection on the top 100 ports.")
         ports = st.text_input("Optional Nmap ports", placeholder="e.g. 80,443 or 1-1000")
@@ -282,7 +290,7 @@ def _new_assessment_page() -> None:
                 return
             targets["web"] = web_target.strip()
         if "burp" in scanners and not burp_api_key.strip():
-            st.error("Enter the API key configured in Burp Suite → Settings → Suite → REST API.")
+            st.error("Configure Burp's REST API URL and key on the Settings page before starting a Burp scan.")
             return
         if "gobuster" in scanners and not wordlist.strip():
             st.error("Enter an existing local wordlist path for Gobuster.")
@@ -302,6 +310,34 @@ def _new_assessment_page() -> None:
         if assessment:
             st.divider()
             _render_assessment(assessment)
+
+
+def _settings_page() -> None:
+    st.markdown("<div class='eyebrow'>CONNECTIONS</div>", unsafe_allow_html=True)
+    st.title("Settings")
+    st.write("Save the Burp Suite REST API connection once. New assessments will reuse it automatically.")
+    settings = load_app_settings()
+    with st.container(border=True):
+        st.subheader("Burp Suite REST API")
+        st.caption("On the Kali VM, keep Burp's API bound to localhost when Burp and this dashboard run on the same machine. Enter the service root only; the app adds your key and API route.")
+        with st.form("burp_connection_settings"):
+            api_url = st.text_input("Service URL", value=settings["burp_api_url"], placeholder="http://127.0.0.1:1337")
+            api_key = st.text_input("API key", value=settings["burp_api_key"], type="password", help="Saved locally in data/app-settings.json and excluded from Git with the rest of data/.")
+            submitted = st.form_submit_button("Save Burp connection", type="primary")
+        if submitted:
+            try:
+                save_burp_settings(api_url.strip(), api_key)
+                settings = load_app_settings()
+                st.success("Burp connection saved. New assessments will use these settings.")
+            except (OSError, ValueError) as exc:
+                st.error(f"Could not save Burp settings: {exc}")
+        if settings["burp_api_key"] and st.button("Forget saved API key", key="forget_burp_api_key"):
+            try:
+                save_burp_settings(settings["burp_api_url"], "")
+                st.success("Saved API key removed.")
+                st.rerun()
+            except OSError as exc:
+                st.error(f"Could not remove saved API key: {exc}")
 
 
 def _history_page() -> None:
@@ -436,7 +472,7 @@ def main() -> None:
         st.title("🛡️ SOC Cyber")
         st.caption("SECURITY OPERATIONS WORKSPACE")
         st.markdown("---")
-        page = st.radio("Workspace", ["New assessment", "Import reports", "Assessment history"], label_visibility="collapsed")
+        page = st.radio("Workspace", ["New assessment", "Import reports", "Assessment history", "Settings"], label_visibility="collapsed")
         st.divider()
         st.caption("Scans start only after you confirm authorization and submit.")
         st.markdown("---")
@@ -445,6 +481,8 @@ def main() -> None:
         _new_assessment_page()
     elif page == "Import reports":
         _import_reports_page()
+    elif page == "Settings":
+        _settings_page()
     else:
         _history_page()
 

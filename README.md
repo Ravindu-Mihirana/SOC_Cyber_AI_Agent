@@ -113,11 +113,13 @@ Greenbone server over GMP.
 
 In Burp Suite, open **Settings → Suite → REST API**, enable the service, and
 create a dedicated API key. Keep it bound to `127.0.0.1` when Burp and this
-dashboard run on the same Kali VM. In **New assessment**, select **Burp**, enter
-the target URL, Burp service URL (normally `http://127.0.0.1:1337`), and API
-key, then choose a scan profile. The app submits the scan, waits for completion,
-stores the raw API result under `data/raw/`, and normalizes issues into the
-assessment. The REST API reference is available from Burp at
+dashboard run on the same Kali VM. In the dashboard's **Settings** page, save
+the service root (normally `http://127.0.0.1:1337`) and API key once. The key is
+kept in the ignored local `data/app-settings.json` file with restrictive POSIX
+permissions. New assessments reuse the saved connection. Select **Burp**, enter
+the target URL, and choose a scan profile. The app submits the scan, waits for
+completion, stores the raw API result under `data/raw/`, and normalizes issues
+into the assessment. The REST API reference is available from Burp at
 `[service URL]/[API key]`; API routes can vary by Burp version.
 
 The `Crawl strategy - fastest` profile crawls without an active audit. Active
