@@ -86,11 +86,15 @@ references useful. A Windows report that was already deleted or left outside
 ## Scanners
 
 - **Nmap:** host/port discovery and optional service-version detection.
+- **Burp Suite:** starts a web scan through Burp Suite's built-in REST API,
+  collects its issues, and adds them to the same assessment, AI analysis, and
+  report export flow. Requires a running Burp instance with its REST API enabled
+  and an API key. Automated active audits depend on your Burp edition/license.
 - **Nikto:** web-server checks; requires Perl and Nikto.
 - **Gobuster:** path discovery; requires Gobuster and a local wordlist.
-- **Burp Suite / OpenVAS (Greenbone):** import completed XML reports manually
-  or save them into the watched report inbox. The inbox agent does not launch
-  scans or connect to scanner APIs.
+- **OpenVAS (Greenbone):** import completed XML reports manually or save them
+  into the watched report inbox. The inbox agent does not launch scans or
+  connect to scanner APIs.
 
 On Linux, Nmap is available in common distribution packages, and Nikto's
 upstream project documents Perl/source installation. Gobuster documents
@@ -105,12 +109,29 @@ it documents Docker/Compose setup and feed storage requirements.
 The current project consumes exported XML reports rather than controlling a
 Greenbone server over GMP.
 
+## Burp Suite connection
+
+In Burp Suite, open **Settings → Suite → REST API**, enable the service, and
+create a dedicated API key. Keep it bound to `127.0.0.1` when Burp and this
+dashboard run on the same Kali VM. In **New assessment**, select **Burp**, enter
+the target URL, Burp service URL (normally `http://127.0.0.1:1337`), and API
+key, then choose a scan profile. The app submits the scan, waits for completion,
+stores the raw API result under `data/raw/`, and normalizes issues into the
+assessment. The REST API reference is available from Burp at
+`[service URL]/[API key]`; API routes can vary by Burp version.
+
+The `Crawl strategy - fastest` profile crawls without an active audit. Active
+audit profiles send test traffic to discovered inputs and may affect the
+target; use them only with explicit authorization. If Burp's API is not
+available in your edition/setup, the existing XML import workflow remains.
+
 ## Burp / OpenVAS report workflow
 
 In the dashboard, select **Import reports**:
 
 - Upload a Burp Suite XML issues report or OpenVAS/Greenbone GMP XML report in
-  **Manual import**.
+  **Manual import**. This is also the fallback for Burp editions or setups
+  without REST scan access.
 - Or start the local **Automatic collection** agent and place reports in
   `data/inbox/` as `burp-*.xml`, `openvas-*.xml`, or `gvm-*.xml`.
 

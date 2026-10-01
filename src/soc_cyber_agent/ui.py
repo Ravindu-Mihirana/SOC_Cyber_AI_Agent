@@ -22,7 +22,8 @@ def _format_created(value: str) -> str:
         return value
 
 
-def _make_assessment(targets: dict[str, str], scanners: list[str], scan_type: str, ports: str, wordlist: str) -> str:
+def _make_assessment(targets: dict[str, str], scanners: list[str], scan_type: str, ports: str, wordlist: str,
+                     burp_api_url: str, burp_api_key: str, burp_profile: str) -> str:
     label = " · ".join(f"{name}: {target}" for name, target in targets.items() if target)
     assessment = new_assessment(label, scanners)
     save_assessment(assessment)
@@ -33,7 +34,9 @@ def _make_assessment(targets: dict[str, str], scanners: list[str], scan_type: st
         status_box.write(f"Running {scanner.title()} against {target}…")
         try:
             findings, raw_path = run_scan(
-                scanner, target, scan_type=scan_type, ports=ports, wordlist=wordlist
+                scanner, target, scan_type=scan_type, ports=ports, wordlist=wordlist,
+                burp_api_url=burp_api_url, burp_api_key=burp_api_key, burp_profile=burp_profile,
+                on_progress=status_box.write if scanner == "burp" else None,
             )
             assessment["findings"].extend(findings)
             assessment["scanner_results"][scanner] = {
@@ -228,6 +231,7 @@ def _new_assessment_page() -> None:
         selected = []
         descriptions = {
             "nmap": "Hosts, ports, and service versions",
+            "burp": "Web crawl and vulnerability audit through Burp Suite",
             "nikto": "Web server checks",
             "gobuster": "Discover web paths from a wordlist",
         }
@@ -244,7 +248,16 @@ def _new_assessment_page() -> None:
         st.markdown("#### 2 · Set target and scan options")
         col_nmap, col_web = st.columns(2)
         nmap_target = col_nmap.text_input("Nmap hostname or IP", placeholder="192.0.2.10")
-        web_target = col_web.text_input("Web target URL (Nikto / Gobuster)", placeholder="https://authorized.example")
+        web_target = col_web.text_input("Web target URL (Burp / Nikto / Gobuster)", placeholder="https://authorized.example")
+        burp_api_url = "http://127.0.0.1:1337"
+        burp_api_key = ""
+        burp_profile = "Crawl strategy - fastest"
+        if "burp" in scanners:
+            with st.expander("Burp Suite connection and scan profile", expanded=True):
+                st.caption("Use Burp's built-in REST API. When the dashboard runs on the Kali VM, keep the service bound to localhost and use this host URL.")
+                burp_api_url = st.text_input("Burp REST API service URL", value=os.environ.get("BURP_API_URL", "http://127.0.0.1:1337"), placeholder="http://127.0.0.1:1337")
+                burp_api_key = st.text_input("Burp REST API key", value=os.environ.get("BURP_API_KEY", ""), type="password", help="Stored only in this Streamlit session. Burp's API key is added to its REST URL path.")
+                burp_profile = st.selectbox("Burp scan profile", ["Crawl strategy - fastest", "Audit checks - light active", "Audit checks - all issues"], help="Audit profiles actively test discovered inputs and can create significant traffic or change target data. Start with the crawl-only profile unless an active audit is approved.")
         scan_type = st.selectbox("Nmap profile", ["quick", "version"], help="Quick scans common ports; version attempts service detection on the top 100 ports.")
         ports = st.text_input("Optional Nmap ports", placeholder="e.g. 80,443 or 1-1000")
         wordlist = st.text_input("Gobuster wordlist path", placeholder="/path/to/wordlist.txt")
@@ -263,18 +276,24 @@ def _new_assessment_page() -> None:
                 st.error("Enter a hostname or IP address for Nmap.")
                 return
             targets["nmap"] = nmap_target.strip()
-        if any(name in scanners for name in ("nikto", "gobuster")):
+        if any(name in scanners for name in ("burp", "nikto", "gobuster")):
             if not web_target.strip():
                 st.error("Enter an http(s) URL for the web scanners.")
                 return
             targets["web"] = web_target.strip()
+        if "burp" in scanners and not burp_api_key.strip():
+            st.error("Enter the API key configured in Burp Suite → Settings → Suite → REST API.")
+            return
         if "gobuster" in scanners and not wordlist.strip():
             st.error("Enter an existing local wordlist path for Gobuster.")
             return
-        missing = [name for name in scanners if not availability[name][0]]
+        missing = [name for name in scanners if name != "burp" and not availability[name][0]]
         if missing:
             st.warning(f"Unavailable scanners will be recorded as failed: {', '.join(missing)}")
-        assessment_id = _make_assessment(targets, scanners, scan_type, ports.strip(), wordlist.strip())
+        assessment_id = _make_assessment(
+            targets, scanners, scan_type, ports.strip(), wordlist.strip(),
+            burp_api_url.strip(), burp_api_key.strip(), burp_profile,
+        )
         st.session_state["current_assessment_id"] = assessment_id
         st.rerun()
     current_id = st.session_state.get("current_assessment_id")
