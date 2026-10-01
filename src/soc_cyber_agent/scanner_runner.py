@@ -70,7 +70,7 @@ def _run(args: list[str], *, timeout: int) -> None:
 
 
 def _burp_request(base_url: str, api_key: str, route: str, *, payload: dict[str, object] | None = None,
-                  timeout: int = 30) -> object:
+                  timeout: int = 30, include_headers: bool = False) -> object:
     """Call the Burp Suite Professional REST API (API key is a URL path segment)."""
     url = f"{base_url.rstrip('/')}/{quote(api_key, safe='')}/v0.1/{route.lstrip('/')}"
     body = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -78,6 +78,7 @@ def _burp_request(base_url: str, api_key: str, route: str, *, payload: dict[str,
     try:
         with urlopen(request, timeout=timeout) as response:
             raw = response.read(20 * 1024 * 1024 + 1)
+            response_headers = dict(response.headers.items())
     except HTTPError as exc:
         detail = exc.read(2000).decode("utf-8", "replace")
         raise ScannerError(f"Burp API returned HTTP {exc.code}: {detail or exc.reason}") from exc
@@ -86,9 +87,14 @@ def _burp_request(base_url: str, api_key: str, route: str, *, payload: dict[str,
     if len(raw) > 20 * 1024 * 1024:
         raise ScannerError("Burp API response exceeded the 20 MB safety limit.")
     if not raw:
+        if include_headers:
+            return {"_response_body": {}, "_response_headers": response_headers}
         return {}
     try:
-        return json.loads(raw)
+        result = json.loads(raw)
+        if include_headers:
+            return {"_response_body": result, "_response_headers": response_headers}
+        return result
     except json.JSONDecodeError as exc:
         raise ScannerError("Burp API returned an unexpected response. Check the API base URL and key.") from exc
 
@@ -146,11 +152,19 @@ def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api
     if profile not in allowed_profiles:
         raise ScannerError("Choose a supported Burp scan profile.")
 
-    started = _burp_request(api_url, api_key.strip(), "scan", payload={
+    start_response = _burp_request(api_url, api_key.strip(), "scan", payload={
         "urls": [target],
         "scan_configurations": [{"name": profile, "type": "NamedConfiguration"}],
-    })
-    task_id = (started.get("task_id") or started.get("scan_id")) if isinstance(started, dict) else None
+    }, include_headers=True)
+    started = start_response.get("_response_body") if isinstance(start_response, dict) else start_response
+    response_headers = start_response.get("_response_headers", {}) if isinstance(start_response, dict) else {}
+    task_id = None
+    if isinstance(started, dict):
+        task_id = started.get("task_id") or started.get("taskId") or started.get("scan_id") or started.get("id")
+    if not task_id and isinstance(response_headers, dict):
+        location = str(response_headers.get("Location") or response_headers.get("location") or "")
+        if location:
+            task_id = urlparse(location).path.rstrip("/").split("/")[-1]
     if not task_id:
         raise ScannerError("Burp did not return a scan task ID. Check the REST API documentation for this Burp version.")
     if on_progress:
