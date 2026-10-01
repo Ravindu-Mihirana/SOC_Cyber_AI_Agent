@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "nmap": {
+      "command": "soc-cyber-nmap",
+      "args": []
+    }
+  }
+}
