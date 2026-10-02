@@ -493,7 +493,7 @@ def main() -> None:
         </style>
     """, unsafe_allow_html=True)
     with st.sidebar:
-        st.title("🛡️ SOC Cyber")
+        st.title("🛡️ Cyber AI Agent")
         st.caption("SECURITY OPERATIONS WORKSPACE")
         st.markdown("---")
         page = st.radio("Workspace", ["New assessment", "Import reports", "Assessment history", "Settings"], label_visibility="collapsed")
