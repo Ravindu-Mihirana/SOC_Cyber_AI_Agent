@@ -18,7 +18,7 @@ from .models import Finding
 from .nmap_parser import parse_nmap_xml
 from .report_importers import _cves
 from .storage import data_dir
-from .web_parsers import parse_gobuster_text, parse_nikto_json
+from .web_parsers import parse_gobuster_text, parse_nikto_json, parse_nikto_text
 
 SCANNERS = ("nmap", "burp", "nikto", "gobuster")
 
@@ -57,16 +57,17 @@ def _check_url(target: str) -> None:
         raise ScannerError("Web scanner target must be an http(s) URL without embedded credentials.")
 
 
-def _run(args: list[str], *, timeout: int) -> None:
+def _run(args: list[str], *, timeout: int, allow_nonzero: bool = False) -> subprocess.CompletedProcess[str]:
     try:
         completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
     except FileNotFoundError as exc:
         raise ScannerError(f"Scanner executable not found: {args[0]}") from exc
     except subprocess.TimeoutExpired as exc:
         raise ScannerError(f"Scan timed out after {timeout} seconds.") from exc
-    if completed.returncode != 0:
+    if completed.returncode != 0 and not allow_nonzero:
         detail = (completed.stderr or completed.stdout or "No scanner error details were returned.").strip()
         raise ScannerError(detail[-2500:])
+    return completed
 
 
 def _burp_request(base_url: str, api_key: str, route: str, *, payload: dict[str, object] | None = None,
@@ -139,7 +140,7 @@ def _burp_issue_findings(issues_response: object, *, target: str, job_id: str) -
 
 
 def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api_key: str,
-                   profile: str, on_progress: Callable[[str], None] | None = None,
+                   profile: str = "", on_progress: Callable[[str], None] | None = None,
                    timeout: int = 7200) -> tuple[list[Finding], Path, str]:
     """Start and monitor a Burp scan, then persist the API's raw issue response."""
     _check_url(target)
@@ -148,14 +149,14 @@ def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api
         raise ScannerError("Burp REST API URL must be an http(s) URL without embedded credentials.")
     if not api_key.strip():
         raise ScannerError("Enter the API key configured in Burp Suite REST API settings.")
-    allowed_profiles = {"Crawl strategy - fastest", "Audit checks - light active", "Audit checks - all issues"}
-    if profile not in allowed_profiles:
-        raise ScannerError("Choose a supported Burp scan profile.")
-
-    start_response = _burp_request(api_url, api_key.strip(), "scan", payload={
-        "urls": [target],
-        "scan_configurations": [{"name": profile, "type": "NamedConfiguration"}],
-    }, include_headers=True)
+    scan_request: dict[str, object] = {"urls": [target]}
+    # Named scan configurations are installation-specific. Omit this field by
+    # default so Burp uses its own configured default instead of a guessed name.
+    if profile.strip():
+        scan_request["scan_configurations"] = [{"name": profile.strip(), "type": "NamedConfiguration"}]
+    start_response = _burp_request(
+        api_url, api_key.strip(), "scan", payload=scan_request, include_headers=True,
+    )
     started = start_response.get("_response_body") if isinstance(start_response, dict) else start_response
     response_headers = start_response.get("_response_headers", {}) if isinstance(start_response, dict) else {}
     task_id = None
@@ -168,7 +169,7 @@ def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api
     if not task_id:
         raise ScannerError("Burp did not return a scan task ID. Check the REST API documentation for this Burp version.")
     if on_progress:
-        on_progress(f"Burp accepted scan {task_id} · {profile}")
+        on_progress(f"Burp accepted scan {task_id} · {profile.strip() or 'Burp default configuration'}")
 
     deadline = time.monotonic() + timeout
     status: object = {}
@@ -216,7 +217,7 @@ def run_scan(
     wordlist: str = "",
     burp_api_url: str = "http://127.0.0.1:1337",
     burp_api_key: str = "",
-    burp_profile: str = "Crawl strategy - fastest",
+    burp_profile: str = "",
     on_progress: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, object]], str]:
     """Execute one scan and return normalized findings plus the raw-output path."""
@@ -258,8 +259,36 @@ def run_scan(
             raise ScannerError("Nikto was not found. Install Nikto and Perl, or set NIKTO_SCRIPT to nikto.pl.")
         raw_path = raw_dir / f"{job_id}-nikto.json"
         args = command + ["-h", target, "-output", str(raw_path), "-Format", "json", "-maxtime", "5m", "-timeout", "10", "-nointeractive", "-nocheck"]
-        _run(args, timeout=360)
-        findings = parse_nikto_json(raw_path, target=target, job_id=job_id)
+        completed = _run(args, timeout=360, allow_nonzero=True)
+        console_output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
+        log_path = raw_dir / f"{job_id}-nikto.log"
+        if console_output:
+            log_path.write_text(console_output + "\n", encoding="utf-8", errors="replace")
+        findings: list[Finding] = []
+        output_error = ""
+        json_parsed = False
+        if raw_path.is_file() and raw_path.stat().st_size:
+            try:
+                findings = parse_nikto_json(raw_path, target=target, job_id=job_id)
+                json_parsed = True
+            except (OSError, ValueError) as exc:
+                output_error = str(exc)
+        if not findings and console_output:
+            findings = parse_nikto_text(console_output, target=target, job_id=job_id)
+            if findings:
+                raw_path = log_path
+        if completed.returncode != 0 and not findings:
+            detail = console_output[-2500:] or f"Nikto exited with code {completed.returncode}."
+            if output_error:
+                detail = f"{detail}\nCould not use the Nikto JSON report: {output_error}"
+            raise ScannerError(f"Nikto exited with code {completed.returncode} and returned no parseable findings. {detail}")
+        if not findings and not json_parsed:
+            detail = f" Could not parse the Nikto JSON report: {output_error}" if output_error else ""
+            raise ScannerError(f"Nikto did not return parseable scan results.{detail}")
+        if not raw_path.is_file() or not raw_path.stat().st_size:
+            if not log_path.is_file():
+                raise ScannerError("Nikto completed without producing a JSON report or console output.")
+            raw_path = log_path
     else:
         _check_url(target)
         executable = shutil.which("gobuster")

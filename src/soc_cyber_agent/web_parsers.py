@@ -9,6 +9,7 @@ from .models import Finding, utc_now
 
 _CVE_PATTERN = re.compile(r"\bCVE-\d{4}-\d{4,7}\b", re.IGNORECASE)
 _GOBUSTER_PATTERN = re.compile(r"^(.+?)\s+\(Status:\s*(\d{3})\)(.*)$")
+_NIKTO_TEXT_FINDING = re.compile(r"^\s*\+\s+\[(\d{6})\]\s+(.*)$")
 
 
 def _web_location(target: str, location: str) -> tuple[str, int | None, str | None]:
@@ -25,7 +26,11 @@ def parse_nikto_json(path: str | Path, *, target: str, job_id: str) -> list[Find
     """Parse Nikto JSON findings; leave severity unknown unless supplied."""
     data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     host, port, protocol = _web_location(target, "")
-    vulnerabilities = data.get("vulnerabilities", []) if isinstance(data, dict) else []
+    if not isinstance(data, dict):
+        raise ValueError("Nikto JSON report must contain an object at its root.")
+    vulnerabilities = next((data[key] for key in ("vulnerabilities", "findings", "results", "items") if isinstance(data.get(key), list)), None)
+    if vulnerabilities is None:
+        raise ValueError("Unrecognized Nikto JSON report structure.")
     findings: list[Finding] = []
     for index, item in enumerate(vulnerabilities):
         if not isinstance(item, dict):
@@ -42,6 +47,32 @@ def parse_nikto_json(path: str | Path, *, target: str, job_id: str) -> list[Find
             description=message, severity=severity, cve_ids=sorted(set(_CVE_PATTERN.findall(evidence))),
             evidence=evidence, raw_ref=job_id, timestamp=utc_now(),
             status="open", service_name=path_ref or None,
+        ))
+    return findings
+
+
+def parse_nikto_text(output: str, *, target: str, job_id: str) -> list[Finding]:
+    """Parse Nikto's human-readable test lines when JSON output is unavailable."""
+    host, port, protocol = _web_location(target, "")
+    findings: list[Finding] = []
+    for line_number, line in enumerate(output.splitlines()):
+        match = _NIKTO_TEXT_FINDING.match(line)
+        if not match:
+            continue
+        test_id, message = match.groups()
+        message = message.strip()
+        location, _, detail = message.partition(": ")
+        if not detail:
+            detail = message
+            location = "/"
+        findings.append(Finding(
+            id=f"{job_id}:nikto:{line_number}", source_tool="nikto", target=target,
+            host=host, port=port, protocol=protocol,
+            title=f"Nikto [{test_id}] {message}"[:240],
+            description=message, severity="unknown",
+            cve_ids=sorted(set(_CVE_PATTERN.findall(message))),
+            evidence=line.rstrip(), raw_ref=job_id, timestamp=utc_now(),
+            service_name=location or None,
         ))
     return findings
 

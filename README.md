@@ -117,15 +117,17 @@ dashboard run on the same Kali VM. In the dashboard's **Settings** page, save
 the service root (normally `http://127.0.0.1:1337`) and API key once. The key is
 kept in the ignored local `data/app-settings.json` file with restrictive POSIX
 permissions. New assessments reuse the saved connection. Select **Burp**, enter
-the target URL, and choose a scan profile. The app submits the scan, waits for
-completion, stores the raw API result under `data/raw/`, and normalizes issues
-into the assessment. The REST API reference is available from Burp at
+the target URL. The app asks Burp to use its configured default scan behavior,
+waits for completion, stores the raw API result under `data/raw/`, and normalizes
+issues into the assessment. The REST API reference is available from Burp at
 `[service URL]/[API key]`; API routes can vary by Burp version.
 
-The `Crawl strategy - fastest` profile crawls without an active audit. Active
-audit profiles send test traffic to discovered inputs and may affect the
-target; use them only with explicit authorization. If Burp's API is not
-available in your edition/setup, the existing XML import workflow remains.
+Set Burp's default scan behavior in Burp itself before launching scans. Active
+audits send test traffic to discovered inputs and may affect the target; use
+them only with explicit authorization. Named scan configurations can vary by
+Burp installation, so the integration does not assume a built-in name. If
+Burp's API is not available in your edition/setup, the existing XML import
+workflow remains.
 
 ## Burp / OpenVAS report workflow
 

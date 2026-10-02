@@ -258,14 +258,14 @@ def _new_assessment_page() -> None:
         web_target = col_web.text_input("Web target URL (Burp / Nikto / Gobuster)", placeholder="https://authorized.example")
         burp_api_url = burp_settings["burp_api_url"]
         burp_api_key = burp_settings["burp_api_key"]
-        burp_profile = "Crawl strategy - fastest"
+        burp_profile = ""
         if "burp" in scanners:
             with st.expander("Burp Suite connection and scan profile", expanded=True):
                 if burp_api_key:
                     st.success(f"Using saved Burp connection · {burp_api_url}")
                 else:
                     st.warning("Burp connection is not configured. Add its service URL and API key on the Settings page.")
-                burp_profile = st.selectbox("Burp scan profile", ["Crawl strategy - fastest", "Audit checks - light active", "Audit checks - all issues"], help="Audit profiles actively test discovered inputs and can create significant traffic or change target data. Start with the crawl-only profile unless an active audit is approved.")
+                st.caption("The scan uses Burp's default configuration. Named configurations differ between Burp installations; set the default scan behavior in Burp itself.")
         scan_type = st.selectbox("Nmap profile", ["quick", "version"], help="Quick scans common ports; version attempts service detection on the top 100 ports.")
         ports = st.text_input("Optional Nmap ports", placeholder="e.g. 80,443 or 1-1000")
         wordlist = st.text_input("Gobuster wordlist path", placeholder="/path/to/wordlist.txt")
