@@ -258,14 +258,38 @@ def _new_assessment_page() -> None:
         web_target = col_web.text_input("Web target URL (Burp / Nikto / Gobuster)", placeholder="https://authorized.example")
         burp_api_url = burp_settings["burp_api_url"]
         burp_api_key = burp_settings["burp_api_key"]
-        burp_profile = ""
+        burp_profile = "Crawl and Audit - Lightweight"
         if "burp" in scanners:
             with st.expander("Burp Suite connection and scan profile", expanded=True):
                 if burp_api_key:
                     st.success(f"Using saved Burp connection · {burp_api_url}")
                 else:
                     st.warning("Burp connection is not configured. Add its service URL and API key on the Settings page.")
-                st.caption("The scan uses Burp's default configuration. Named configurations differ between Burp installations; set the default scan behavior in Burp itself.")
+                burp_modes = {
+                    "Lightweight": "Crawl and Audit - Lightweight",
+                    "Fast": "Crawl and Audit - Fast",
+                    "Balanced": "Crawl and Audit - Balanced",
+                    "Deep": "Crawl and Audit - Deep",
+                    "Custom": "",
+                }
+                burp_mode = st.selectbox(
+                    "Burp Crawl & Audit configuration",
+                    options=list(burp_modes),
+                    index=0,
+                    help="Choose how much time Burp spends crawling the site and auditing for vulnerabilities.",
+                    key="burp_scan_mode",
+                )
+                if burp_mode == "Custom":
+                    burp_profile = st.text_input(
+                        "Saved custom configuration name",
+                        placeholder="Enter the exact configuration name from Burp",
+                        help="Import or save your custom configuration in Burp, then enter its exact name here.",
+                        key="burp_custom_profile",
+                    ).strip()
+                    st.caption("Custom configurations must already exist in Burp's configuration library.")
+                else:
+                    burp_profile = burp_modes[burp_mode]
+                    st.caption(f"Burp will run Crawl and Audit using: {burp_profile}")
         scan_type = st.selectbox("Nmap profile", ["quick", "version"], help="Quick scans common ports; version attempts service detection on the top 100 ports.")
         ports = st.text_input("Optional Nmap ports", placeholder="e.g. 80,443 or 1-1000")
         wordlist = st.text_input("Gobuster wordlist path", placeholder="/path/to/wordlist.txt")
