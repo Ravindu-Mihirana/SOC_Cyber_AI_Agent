@@ -14,6 +14,7 @@ from soc_cyber_agent.reports import render_html, render_pdf
 from soc_cyber_agent.report_importers import ReportImportError, parse_burp_xml, parse_openvas_xml
 from soc_cyber_agent.report_agent import agent_status, start_report_agent, stop_report_agent
 from soc_cyber_agent.scanner_runner import SCANNERS, ScannerError, run_scan, scanner_availability
+from soc_cyber_agent.tool_catalog import TOOL_CATEGORIES, catalog_tool_status
 from soc_cyber_agent.storage import (
     data_dir, delete_assessment, get_assessment, list_assessment_scans,
     list_assessments, new_assessment, next_scan_number, save_assessment,
@@ -414,6 +415,31 @@ def _dashboard_page() -> None:
                          on_click=_navigate_to, args=("Settings",)):
                 st.rerun(scope="app")
 
+    catalog_count = sum(len(category["tools"]) for category in TOOL_CATEGORIES)
+    st.markdown("### Security tool catalog")
+    st.caption(
+        f"{len(TOOL_CATEGORIES)} categories · {catalog_count} tools. The catalog shows whether each item is "
+        "directly integrated, import-only, installed but awaiting an adapter, or needs an API/agent connection."
+    )
+    tool_query = st.text_input("Filter tools", placeholder="Search by name, category, or capability…", key="dashboard_tool_filter").strip().casefold()
+    catalog_availability = scanner_availability()
+    catalog_settings = load_app_settings()
+    for category in TOOL_CATEGORIES:
+        visible_tools = [
+            tool for tool in category["tools"]
+            if not tool_query or tool_query in category["name"].casefold()
+            or tool_query in tool["name"].casefold() or tool_query in tool["summary"].casefold()
+        ]
+        if not visible_tools:
+            continue
+        with st.expander(f"{category['name']} · {len(visible_tools)} tools", expanded=bool(tool_query)):
+            for tool in visible_tools:
+                state, detail = catalog_tool_status(tool, catalog_availability, catalog_settings)
+                name_cell, summary_cell, status_cell = st.columns([1.2, 2.4, 2])
+                name_cell.markdown(f"**[{tool['name']}]({tool['url']})**" if tool.get("url") else f"**{tool['name']}**")
+                summary_cell.caption(tool["summary"])
+                status_cell.caption(f"{state} · {detail}")
+
     st.markdown("### Recent assessments")
     for assessment in assessments[:5]:
         left, middle, right = st.columns([3, 1, 1])
@@ -576,13 +602,11 @@ def _settings_page() -> None:
             else:
                 st.warning("No models were returned. Check the HTTPS endpoint and API key; you can still enter the exact model name.")
             st.rerun()
-        model_options = list(dict.fromkeys([*models, settings["ai_model"]]))
         if models:
-            manual_option = "Enter model name manually…"
-            selected_model = st.selectbox("Model", [*model_options, manual_option], key="settings_ai_model_select")
-            ai_model = st.text_input("Model name", value=settings["ai_model"], key="settings_ai_model_text") if selected_model == manual_option else selected_model
-        else:
-            ai_model = st.text_input("Model name", value=settings["ai_model"], key="settings_ai_model_text")
+            st.caption("Models advertised by this provider (copy the exact chat-capable model ID into the field below):")
+            st.code("\n".join(models), language=None)
+        ai_model = st.text_input("Model name", value=settings["ai_model"], key="settings_ai_model_text",
+                                 help="This value is sent unchanged to the chat completions API.")
         if st.button("Save cloud AI settings", type="primary", key="save_ai_settings"):
             try:
                 save_ai_settings(ai_base_url.strip(), ai_model, ai_api_key)

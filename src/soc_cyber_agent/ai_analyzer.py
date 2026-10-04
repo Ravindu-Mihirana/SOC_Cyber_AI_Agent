@@ -101,6 +101,25 @@ def _request_analysis(system: str, user: str, *, base_url: str, model: str, api_
         request = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
         with urllib.request.urlopen(request, timeout=180) as response:
             result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            body = json.loads(exc.read().decode("utf-8", errors="replace"))
+            error = body.get("error", {}) if isinstance(body, dict) else {}
+            detail = error.get("message", "") if isinstance(error, dict) else str(error)
+            error_code = str(error.get("code", "") or error.get("type", "")).casefold() if isinstance(error, dict) else ""
+        except (json.JSONDecodeError, OSError):
+            detail, error_code = "", ""
+        if exc.code == 429 and ("quota" in error_code or "billing" in error_code or "quota" in detail.casefold()):
+            raise AIAnalysisError(
+                f"The AI provider reports that this API account has no available quota or billing is not enabled. "
+                f"Check the provider's API billing and usage limits. Model: {model}. {detail}".strip()
+            ) from exc
+        if exc.code == 429:
+            raise AIAnalysisError(
+                f"The AI provider rate-limited this request (HTTP 429). Wait and retry, or check the provider's "
+                f"rate limits and usage page. Model: {model}. {detail}".strip()
+            ) from exc
+        raise AIAnalysisError(f"AI provider returned HTTP {exc.code}. {detail}".strip()) from exc
     except urllib.error.URLError as exc:
         raise AIAnalysisError(f"Could not reach the selected AI endpoint: {exc}") from exc
     except (TimeoutError, json.JSONDecodeError) as exc:
