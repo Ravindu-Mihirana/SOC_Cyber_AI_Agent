@@ -1,6 +1,7 @@
 """Streamlit dashboard for scans, AI review, history, and report downloads."""
 
 import os
+import threading
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -8,7 +9,7 @@ from uuid import uuid4
 import streamlit as st
 
 from soc_cyber_agent.app_settings import load_app_settings, save_burp_settings
-from soc_cyber_agent.ai_analyzer import AIAnalysisError, analyze_findings
+from soc_cyber_agent.ai_analyzer import AIAnalysisError, analyze_assessment, list_models
 from soc_cyber_agent.reports import render_html, render_pdf
 from soc_cyber_agent.report_importers import ReportImportError, parse_burp_xml, parse_openvas_xml
 from soc_cyber_agent.report_agent import agent_status, start_report_agent, stop_report_agent
@@ -23,39 +24,82 @@ def _format_created(value: str) -> str:
         return value
 
 
+def _navigate_to(page: str) -> None:
+    st.session_state["workspace_page"] = page
+
+
+def _open_assessment(assessment_id: str) -> None:
+    st.session_state["current_assessment_id"] = assessment_id
+    st.session_state["workspace_page"] = "Assessment history"
+
+
 def _make_assessment(targets: dict[str, str], scanners: list[str], scan_type: str, ports: str, wordlist: str,
                      burp_api_url: str, burp_api_key: str, burp_profile: str) -> str:
     label = " · ".join(f"{name}: {target}" for name, target in targets.items() if target)
     assessment = new_assessment(label, scanners)
+    assessment["scanner_results"] = {
+        scanner: {"status": "queued", "target": targets["nmap"] if scanner == "nmap" else targets["web"]}
+        for scanner in scanners
+    }
     save_assessment(assessment)
-    progress = st.progress(0, text="Preparing assessment")
-    status_box = st.status("Assessment in progress", expanded=True)
-    for index, scanner in enumerate(scanners, start=1):
+    worker = threading.Thread(
+        target=_run_assessment_worker,
+        args=(assessment["id"], targets, scanners, scan_type, ports, wordlist, burp_api_url, burp_api_key, burp_profile),
+        name=f"scan-{assessment['id'][:8]}", daemon=True,
+    )
+    worker.start()
+    return assessment["id"]
+
+
+def _run_assessment_worker(assessment_id: str, targets: dict[str, str], scanners: list[str], scan_type: str,
+                           ports: str, wordlist: str, burp_api_url: str, burp_api_key: str, burp_profile: str) -> None:
+    """Run scanner work off the Streamlit request and persist each state change."""
+    for scanner in scanners:
+        assessment = get_assessment(assessment_id)
+        if not assessment:
+            return
         target = targets["nmap"] if scanner == "nmap" else targets["web"]
-        status_box.write(f"Running {scanner.title()} against {target}…")
+        assessment["scanner_results"][scanner] = {"status": "running", "target": target, "detail": f"Starting {scanner.title()}"}
+        save_assessment(assessment)
+
+        def report_progress(message: str, scanner_name: str = scanner) -> None:
+            latest = get_assessment(assessment_id)
+            if not latest:
+                return
+            result = latest["scanner_results"].get(scanner_name, {})
+            result["detail"] = message
+            import re
+            match = re.search(r"(\d{1,3})%", message)
+            if match:
+                result["progress"] = min(100, int(match.group(1)))
+            latest["scanner_results"][scanner_name] = result
+            save_assessment(latest)
+
         try:
             findings, raw_path = run_scan(
                 scanner, target, scan_type=scan_type, ports=ports, wordlist=wordlist,
                 burp_api_url=burp_api_url, burp_api_key=burp_api_key, burp_profile=burp_profile,
-                on_progress=status_box.write if scanner == "burp" else None,
+                on_progress=report_progress if scanner == "burp" else None,
             )
+            assessment = get_assessment(assessment_id)
+            if not assessment:
+                return
             assessment["findings"].extend(findings)
             assessment["scanner_results"][scanner] = {
-                "status": "complete", "target": target, "count": len(findings), "raw_path": raw_path,
+                "status": "complete", "target": target, "count": len(findings), "raw_path": raw_path, "progress": 100,
             }
-            status_box.write(f"{scanner.title()} completed: {len(findings)} findings")
-        except (ScannerError, OSError, ValueError) as exc:
-            assessment["scanner_results"][scanner] = {
-                "status": "failed", "target": target, "error": str(exc),
-            }
-            status_box.write(f"{scanner.title()} could not complete: {exc}")
+        except Exception as exc:
+            assessment = get_assessment(assessment_id)
+            if not assessment:
+                return
+            assessment["scanner_results"][scanner] = {"status": "failed", "target": target, "error": str(exc), "progress": 100}
+        assessment["status"] = "running"
         save_assessment(assessment)
-        progress.progress(index / len(scanners), text=f"Finished {scanner.title()}")
-    completed = any(item.get("status") == "complete" for item in assessment["scanner_results"].values())
-    assessment["status"] = "complete" if completed else "failed"
-    save_assessment(assessment)
-    status_box.update(label="Assessment finished" if completed else "Assessment failed", state="complete" if completed else "error")
-    return assessment["id"]
+    assessment = get_assessment(assessment_id)
+    if assessment:
+        completed = any(item.get("status") == "complete" for item in assessment["scanner_results"].values())
+        assessment["status"] = "complete" if completed else "failed"
+        save_assessment(assessment)
 
 
 def _findings_table(findings: list[dict[str, Any]]) -> None:
@@ -104,49 +148,56 @@ def _findings_table(findings: list[dict[str, Any]]) -> None:
 
 def _render_ai(assessment: dict[str, Any]) -> None:
     findings = assessment.get("findings", [])
-    scanner_names = sorted({str(item.get("source_tool", "unknown")) for item in findings})
-    if not scanner_names:
+    if not findings:
         st.info("Run a scanner successfully before requesting AI analysis.")
         return
-    st.subheader("AI analysis")
-    st.caption("Analysis is advisory. Review the supporting scanner evidence before acting on recommendations.")
+    st.subheader("Unified AI assessment")
+    st.caption("One analysis correlates every scanner’s findings and returns a prioritized remediation plan. Recommendations are advisory.")
     with st.expander("AI connection and privacy", expanded=False):
         provider = st.selectbox("Provider", ["Ollama (local)", "OpenAI-compatible endpoint"], key="ai_provider")
         default_base = os.environ.get("SOC_AI_BASE_URL", "http://127.0.0.1:11434") if provider == "Ollama (local)" else os.environ.get("SOC_AI_BASE_URL", "https://api.openai.com")
         base_url = st.text_input("Base URL", value=default_base, key=f"ai_url_{provider}")
         default_model = os.environ.get("SOC_AI_MODEL", "llama3.1:8b") if provider == "Ollama (local)" else os.environ.get("SOC_AI_MODEL", "gpt-4o-mini")
-        model = st.text_input("Model", value=default_model, key=f"ai_model_{provider}")
         api_key = ""
         if provider != "Ollama (local)":
             api_key = st.text_input(
                 "API key (used for this session only)",
                 value=os.environ.get("SOC_AI_API_KEY", ""), type="password", key="ai_api_key",
             )
+        models_key = f"available_models_{provider}_{base_url}"
+        available_models = st.session_state.get(models_key, [])
+        model_options = list(dict.fromkeys([*available_models, default_model]))
+        model = st.selectbox("Model", model_options, key=f"ai_model_{provider}") if available_models else st.text_input("Model name", value=default_model, key=f"ai_model_text_{provider}")
+        if st.button("Refresh available models", key=f"refresh_models_{provider}"):
+            available_models = list_models(provider=provider, base_url=base_url, api_key=api_key)
+            st.session_state[models_key] = available_models
+            if available_models:
+                st.success(f"Found {len(available_models)} model(s).")
+            else:
+                st.warning("No models were returned. Check the endpoint, credentials, and service status; you can still enter a model name.")
+            st.rerun()
         allow_send = st.checkbox("I reviewed the privacy choice and allow sending normalized finding details to this endpoint.", key="ai_allow_send")
         if provider != "Ollama (local)":
-            st.warning("The selected remote service will receive finding titles, descriptions, and evidence. Avoid sending confidential assessment data unless approved.")
+            st.warning("The selected cloud service will receive normalized findings, evidence, and scanner coverage. Send them only when approved for this data.")
         else:
-            st.caption("Ollama is local when pointed at localhost; cloud models/endpoints may transmit data externally.")
-    if st.button("Analyze each scanner's results", type="primary", disabled=not allow_send, key="analyze_all"):
+            st.caption("Ollama stays local when its endpoint is on this device. Remote Ollama endpoints may transmit data externally.")
+    if st.button("Analyze all tool results", type="primary", disabled=not allow_send, key="analyze_all"):
         analyses = assessment.setdefault("analyses", {})
         with st.spinner("Analyzing normalized findings…"):
-            for scanner in scanner_names:
-                scanner_findings = [item for item in findings if item.get("source_tool") == scanner]
-                result = assessment.get("scanner_results", {}).get(scanner, {})
-                try:
-                    analyses[scanner] = analyze_findings(
-                        scanner, str(result.get("target", assessment.get("target", ""))), scanner_findings,
-                        provider=provider, base_url=base_url, model=model, api_key=api_key,
-                    )
-                except AIAnalysisError as exc:
-                    analyses[scanner] = f"Analysis unavailable: {exc}"
-                save_assessment(assessment)
+            try:
+                analyses["unified"] = analyze_assessment(
+                    str(assessment.get("target", "")), findings, assessment.get("scanner_results", {}),
+                    provider=provider, base_url=base_url, model=model, api_key=api_key,
+                )
+            except AIAnalysisError as exc:
+                analyses["unified"] = f"Analysis unavailable: {exc}"
+            save_assessment(assessment)
         st.rerun()
     analyses = assessment.get("analyses", {})
-    if analyses:
-        for scanner, analysis in analyses.items():
-            with st.expander(f"{scanner.title()} analysis", expanded=True):
-                st.markdown(str(analysis))
+    if analyses.get("unified"):
+        st.markdown(str(analyses["unified"]))
+    elif analyses:
+        st.info("Existing per-scanner analyses are available in this assessment’s saved history.")
 
 
 def _render_report_downloads(assessment: dict[str, Any]) -> None:
@@ -180,14 +231,17 @@ def _render_assessment(assessment: dict[str, Any]) -> None:
         st.markdown("#### Scanner activity")
         if scanners:
             for name, result in scanners.items():
-                label = "Complete" if result.get("status") == "complete" else "Failed"
                 with st.container(border=True):
                     left, middle, right = st.columns([1, 2, 2])
                     left.markdown(f"**{name.title()}**")
                     if result.get("status") == "complete":
-                        middle.success(f"{label} · {result.get('count', 0)} findings")
+                        middle.success(f"Complete · {result.get('count', 0)} findings")
+                    elif result.get("status") == "failed":
+                        middle.error(f"Failed · {result.get('error', 'Unknown error')}")
+                    elif result.get("status") == "running":
+                        middle.info(f"Running · {result.get('progress')}%" if result.get("progress") is not None else "Running")
                     else:
-                        middle.error(f"{label} · {result.get('error', 'Unknown error')}")
+                        middle.caption("Queued")
                     right.caption(result.get("target", ""))
                     if result.get("raw_path"):
                         st.caption(f"Raw evidence: {result['raw_path']}")
@@ -207,6 +261,102 @@ def _render_assessment(assessment: dict[str, Any]) -> None:
         st.markdown("### Share this assessment")
         st.write("Download a self-contained report with findings, evidence, scanner status, and any AI analysis.")
         _render_report_downloads(assessment)
+
+
+@st.fragment(run_every=3)
+def _dashboard_page() -> None:
+    assessments = list_assessments()
+    active = [item for item in assessments if item.get("status") == "running"]
+    all_findings = sum(len(item.get("findings", [])) for item in assessments)
+    st.markdown("<div class='eyebrow'>SECURITY OPERATIONS</div>", unsafe_allow_html=True)
+    title, action = st.columns([4, 1])
+    title.title("Security dashboard")
+    if action.button("＋ New scan", type="primary", use_container_width=True, key="dashboard_new_scan",
+                     on_click=_navigate_to, args=("New scan",)):
+        st.rerun(scope="app")
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Running scans", len(active))
+    m2.metric("Saved assessments", len(assessments))
+    m3.metric("Recorded findings", all_findings)
+    m4.metric("Available tools", f"{sum(ready for ready, _ in scanner_availability().values())}/{len(SCANNERS)}")
+
+    st.markdown("### Live scan progress")
+    if not active:
+        st.info("No scans are running. Start a new authorized scan to see per-tool progress here.")
+    for assessment in active:
+        results = assessment.get("scanner_results", {})
+        done = sum(result.get("status") in {"complete", "failed"} for result in results.values())
+        with st.container(border=True):
+            header, view = st.columns([4, 1])
+            header.markdown(f"**{assessment.get('target', 'Assessment')}** · `{assessment['id'][:8]}`")
+            if view.button("Open", key=f"open_active_{assessment['id']}",
+                           on_click=_open_assessment, args=(assessment["id"],)):
+                st.rerun(scope="app")
+            overall = done / max(1, len(results))
+            st.progress(overall, text=f"{done} of {len(results)} tools finished")
+            for scanner, result in results.items():
+                status = result.get("status", "queued")
+                cols = st.columns([1.1, 2.2, 2.7, 1])
+                cols[0].markdown(f"**{scanner.title()}**")
+                if status == "complete":
+                    cols[1].success(f"Complete · {result.get('count', 0)} findings")
+                elif status == "failed":
+                    cols[1].error("Failed")
+                elif status == "running":
+                    cols[1].info("Running")
+                else:
+                    cols[1].caption("Queued")
+                cols[2].caption(result.get("detail") or result.get("error") or result.get("target", ""))
+                if status == "running" and result.get("progress") is not None:
+                    cols[3].caption(f"{result['progress']}%")
+                elif status == "running":
+                    cols[3].caption("In progress")
+
+    st.markdown("### Operations")
+    tools_col, models_col = st.columns([1, 1])
+    with tools_col:
+        with st.container(border=True):
+            st.markdown("#### Available tools")
+            availability = scanner_availability()
+            burp = load_app_settings()
+            for name in SCANNERS:
+                ready, detail = availability[name]
+                if name == "burp":
+                    ready = bool(burp["burp_api_url"] and burp["burp_api_key"])
+                    detail = burp["burp_api_url"] if ready else "Configure REST API in Settings"
+                badge = "Ready" if ready else "Setup needed"
+                st.markdown(f"**{name.title()}** · {badge}")
+                st.caption(detail)
+    with models_col:
+        with st.container(border=True):
+            st.markdown("#### AI models")
+            provider = st.selectbox("Provider", ["Ollama (local)", "OpenAI-compatible endpoint"], key="dashboard_model_provider")
+            base_default = os.environ.get("SOC_AI_BASE_URL", "http://127.0.0.1:11434") if provider == "Ollama (local)" else os.environ.get("SOC_AI_BASE_URL", "https://api.openai.com")
+            base_url = st.text_input("Endpoint", value=base_default, key=f"dashboard_endpoint_{provider}")
+            api_key = ""
+            if provider != "Ollama (local)":
+                api_key = st.text_input("API key (session only)", value=os.environ.get("SOC_AI_API_KEY", ""), type="password", key="dashboard_api_key")
+            cache_key = f"dashboard_model_list_{provider}_{base_url}"
+            if st.button("Load available models", key="dashboard_load_models"):
+                st.session_state[cache_key] = list_models(provider=provider, base_url=base_url, api_key=api_key)
+            models = st.session_state.get(cache_key, [])
+            if models:
+                st.caption(f"{len(models)} model(s) advertised by this endpoint")
+                st.write(", ".join(models))
+            else:
+                st.caption("Load models to query this endpoint. Configure credentials and choose a model in AI analysis.")
+
+    st.markdown("### Recent assessments")
+    for assessment in assessments[:5]:
+        left, middle, right = st.columns([3, 1, 1])
+        left.write(f"{_format_created(assessment.get('created_at', ''))} · {assessment.get('target', '')}")
+        middle.caption(assessment.get("status", "unknown").title())
+        if right.button("View", key=f"dashboard_history_{assessment['id']}",
+                        on_click=_open_assessment, args=(assessment["id"],)):
+            st.rerun(scope="app")
+    if not assessments:
+        st.caption("Your assessments will appear here after a scan or report import.")
 
 
 def _new_assessment_page() -> None:
@@ -332,6 +482,7 @@ def _new_assessment_page() -> None:
     if current_id:
         assessment = get_assessment(current_id)
         if assessment:
+            st.button("View live progress on Dashboard", on_click=_navigate_to, args=("Dashboard",), key="assessment_dashboard_link")
             st.divider()
             _render_assessment(assessment)
 
@@ -496,12 +647,14 @@ def main() -> None:
         st.title("🛡️ Cyber AI Agent")
         st.caption("SECURITY OPERATIONS WORKSPACE")
         st.markdown("---")
-        page = st.radio("Workspace", ["New assessment", "Import reports", "Assessment history", "Settings"], label_visibility="collapsed")
+        page = st.radio("Workspace", ["Dashboard", "New scan", "Import reports", "Assessment history", "Settings"], key="workspace_page", index=0, label_visibility="collapsed")
         st.divider()
         st.caption("Scans start only after you confirm authorization and submit.")
         st.markdown("---")
         st.caption(f"{len(list_assessments())} saved assessments")
-    if page == "New assessment":
+    if page == "Dashboard":
+        _dashboard_page()
+    elif page == "New scan":
         _new_assessment_page()
     elif page == "Import reports":
         _import_reports_page()

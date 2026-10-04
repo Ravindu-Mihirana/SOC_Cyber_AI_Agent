@@ -75,7 +75,10 @@ Supported optional settings:
 | `SOC_AGENT_DATA_DIR` | Location for the local SQLite database, raw reports, and report inbox |
 | `NIKTO_SCRIPT` | Path to `nikto.pl` if Nikto is used from a source checkout |
 
-Assessment history and scanner evidence are stored under `data/` by default.
+The dashboard shows queued, running, and completed scanners for every active
+assessment and refreshes live progress automatically. Scans run in background
+workers, so you can start another assessment or inspect saved results while a
+long-running tool is still working. Assessment history and scanner evidence are stored under `data/` by default.
 Set `SOC_AGENT_DATA_DIR` to move those files outside the source checkout.
 For an OS move, stop the dashboard first, then copy the entire `data/` folder
 to the Linux project. Database scanner-output references are normalized to
@@ -146,9 +149,12 @@ original under `data/raw/`, and moves the inbox copy under
 ## AI analysis
 
 The AI step is explicit and separate from scanning. It supports local Ollama
-and OpenAI-compatible endpoints. The UI requires a privacy confirmation before
-sending normalized findings and evidence to the configured endpoint. AI output
-is advisory; validate it against scanner evidence.
+and cloud or self-hosted OpenAI-compatible endpoints. The dashboard can list
+models advertised by the selected endpoint. One analysis can correlate findings
+from all scanners and return an overall risk summary, prioritized observations,
+and an ordered remediation plan. The UI requires a privacy confirmation before
+sending normalized findings, evidence, and scanner coverage to the endpoint.
+AI output is advisory; validate it against scanner evidence.
 
 ## Reports and data
 
