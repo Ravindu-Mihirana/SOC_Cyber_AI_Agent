@@ -69,9 +69,9 @@ Supported optional settings:
 
 | Variable | Purpose |
 | --- | --- |
-| `SOC_AI_BASE_URL` | AI endpoint URL, such as local Ollama or an OpenAI-compatible service |
-| `SOC_AI_MODEL` | Model name used in the AI panel |
-| `SOC_AI_API_KEY` | Optional API key for a remote AI endpoint |
+| `SOC_AI_BASE_URL` | HTTPS base URL for an OpenAI-compatible online AI service |
+| `SOC_AI_MODEL` | Cloud model name used for analysis |
+| `SOC_AI_API_KEY` | Optional initial API key; configure and save it in Settings |
 | `SOC_AGENT_DATA_DIR` | Location for the local SQLite database, raw reports, and report inbox |
 | `NIKTO_SCRIPT` | Path to `nikto.pl` if Nikto is used from a source checkout |
 
@@ -148,13 +148,19 @@ original under `data/raw/`, and moves the inbox copy under
 
 ## AI analysis
 
-The AI step is explicit and separate from scanning. It supports local Ollama
-and cloud or self-hosted OpenAI-compatible endpoints. The dashboard can list
-models advertised by the selected endpoint. One analysis can correlate findings
-from all scanners and return an overall risk summary, prioritized observations,
-and an ordered remediation plan. The UI requires a privacy confirmation before
-sending normalized findings, evidence, and scanner coverage to the endpoint.
-AI output is advisory; validate it against scanner evidence.
+The AI step is explicit and separate from scanning. It uses an online HTTPS
+OpenAI-compatible endpoint; local Ollama endpoints are not supported. Configure
+the base URL, API key, and model in **Settings**, where the app can list models
+advertised by the service. One analysis correlates findings from all scanners
+and returns an overall risk summary, prioritized observations, and an ordered
+remediation plan. The UI requires a separate privacy confirmation for each
+assessment before sending normalized findings, evidence, and scanner coverage.
+AI output is advisory; validate it against scanner evidence. API credentials are
+stored in the local ignored `data/app-settings.json` file.
+
+Assessment history keeps each scan run as its own record. Re-running an
+assessment creates the next numbered run in that target's history; deleting a
+completed record also removes its associated raw scanner files.
 
 ## Reports and data
 

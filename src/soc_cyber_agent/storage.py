@@ -33,9 +33,20 @@ def _connect() -> sqlite3.Connection:
             status TEXT NOT NULL,
             findings TEXT NOT NULL DEFAULT '[]',
             scanner_results TEXT NOT NULL DEFAULT '{}',
-            analyses TEXT NOT NULL DEFAULT '{}'
+            analyses TEXT NOT NULL DEFAULT '{}',
+            group_id TEXT NOT NULL DEFAULT '',
+            scan_number INTEGER NOT NULL DEFAULT 1,
+            scan_config TEXT NOT NULL DEFAULT '{}'
         )
     """)
+    existing = {row["name"] for row in connection.execute("PRAGMA table_info(assessments)")}
+    for name, declaration in (
+        ("group_id", "TEXT NOT NULL DEFAULT ''"),
+        ("scan_number", "INTEGER NOT NULL DEFAULT 1"),
+        ("scan_config", "TEXT NOT NULL DEFAULT '{}'"),
+    ):
+        if name not in existing:
+            connection.execute(f"ALTER TABLE assessments ADD COLUMN {name} {declaration}")
     connection.commit()
     return connection
 
@@ -43,13 +54,16 @@ def _connect() -> sqlite3.Connection:
 def save_assessment(assessment: dict[str, Any]) -> None:
     with closing(_connect()) as connection:
         connection.execute("""
-            INSERT INTO assessments(id, created_at, target, scanners, status, findings, scanner_results, analyses)
-            VALUES (:id, :created_at, :target, :scanners, :status, :findings, :scanner_results, :analyses)
+            INSERT INTO assessments(id, created_at, target, scanners, status, findings, scanner_results, analyses, group_id, scan_number, scan_config)
+            VALUES (:id, :created_at, :target, :scanners, :status, :findings, :scanner_results, :analyses, :group_id, :scan_number, :scan_config)
             ON CONFLICT(id) DO UPDATE SET
                 status=excluded.status,
                 findings=excluded.findings,
                 scanner_results=excluded.scanner_results,
-                analyses=excluded.analyses
+                analyses=excluded.analyses,
+                group_id=excluded.group_id,
+                scan_number=excluded.scan_number,
+                scan_config=excluded.scan_config
         """, {
             "id": assessment["id"],
             "created_at": assessment["created_at"],
@@ -59,6 +73,9 @@ def save_assessment(assessment: dict[str, Any]) -> None:
             "findings": json.dumps(assessment.get("findings", [])),
             "scanner_results": json.dumps(assessment.get("scanner_results", {})),
             "analyses": json.dumps(assessment.get("analyses", {})),
+            "group_id": assessment.get("group_id", assessment["id"]),
+            "scan_number": assessment.get("scan_number", 1),
+            "scan_config": json.dumps(assessment.get("scan_config", {})),
         })
         connection.commit()
 
@@ -80,6 +97,9 @@ def _decode(row: sqlite3.Row) -> dict[str, Any]:
         "findings": json.loads(row["findings"]),
         "scanner_results": scanner_results,
         "analyses": json.loads(row["analyses"]),
+        "group_id": row["group_id"] or row["id"],
+        "scan_number": row["scan_number"],
+        "scan_config": json.loads(row["scan_config"]),
     }
 
 
@@ -112,11 +132,46 @@ def list_assessments(limit: int = 100) -> list[dict[str, Any]]:
     return [_decode(row) for row in rows]
 
 
-def new_assessment(target: str, scanners: list[str]) -> dict[str, Any]:
+def list_assessment_scans(group_id: str) -> list[dict[str, Any]]:
+    """Return every saved run in one target's scan lineage, oldest first."""
+    with closing(_connect()) as connection:
+        rows = connection.execute(
+            "SELECT * FROM assessments WHERE group_id = ? OR (group_id = '' AND id = ?) ORDER BY scan_number, created_at",
+            (group_id, group_id),
+        ).fetchall()
+    return [_decode(row) for row in rows]
+
+
+def next_scan_number(group_id: str) -> int:
+    with closing(_connect()) as connection:
+        row = connection.execute(
+            "SELECT MAX(scan_number) AS latest FROM assessments WHERE group_id = ? OR (group_id = '' AND id = ?)",
+            (group_id, group_id),
+        ).fetchone()
+    return int(row["latest"] or 0) + 1
+
+
+def delete_assessment(assessment_id: str) -> dict[str, Any] | None:
+    """Delete one assessment record and return its data for evidence cleanup."""
+    with closing(_connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT * FROM assessments WHERE id = ?", (assessment_id,)).fetchone()
+        if not row:
+            connection.rollback()
+            return None
+        assessment = _decode(row)
+        connection.execute("DELETE FROM assessments WHERE id = ?", (assessment_id,))
+        connection.commit()
+    return assessment
+
+
+def new_assessment(target: str, scanners: list[str], *, group_id: str | None = None,
+                   scan_number: int = 1, scan_config: dict[str, Any] | None = None) -> dict[str, Any]:
     from uuid import uuid4
 
+    assessment_id = str(uuid4())
     return {
-        "id": str(uuid4()),
+        "id": assessment_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "target": target,
         "scanners": scanners,
@@ -124,4 +179,7 @@ def new_assessment(target: str, scanners: list[str]) -> dict[str, Any]:
         "findings": [],
         "scanner_results": {},
         "analyses": {},
+        "group_id": group_id or assessment_id,
+        "scan_number": scan_number,
+        "scan_config": scan_config or {},
     }

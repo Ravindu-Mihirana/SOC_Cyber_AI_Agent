@@ -1,20 +1,23 @@
 """Streamlit dashboard for scans, AI review, history, and report downloads."""
 
-import os
 import threading
 from datetime import datetime
+from pathlib import Path, PurePosixPath
 from typing import Any
 from uuid import uuid4
 
 import streamlit as st
 
-from soc_cyber_agent.app_settings import load_app_settings, save_burp_settings
+from soc_cyber_agent.app_settings import load_app_settings, save_ai_settings, save_burp_settings
 from soc_cyber_agent.ai_analyzer import AIAnalysisError, analyze_assessment, list_models
 from soc_cyber_agent.reports import render_html, render_pdf
 from soc_cyber_agent.report_importers import ReportImportError, parse_burp_xml, parse_openvas_xml
 from soc_cyber_agent.report_agent import agent_status, start_report_agent, stop_report_agent
 from soc_cyber_agent.scanner_runner import SCANNERS, ScannerError, run_scan, scanner_availability
-from soc_cyber_agent.storage import data_dir, get_assessment, list_assessments, new_assessment, save_assessment
+from soc_cyber_agent.storage import (
+    data_dir, delete_assessment, get_assessment, list_assessment_scans,
+    list_assessments, new_assessment, next_scan_number, save_assessment,
+)
 
 
 def _format_created(value: str) -> str:
@@ -33,10 +36,77 @@ def _open_assessment(assessment_id: str) -> None:
     st.session_state["workspace_page"] = "Assessment history"
 
 
+def _delete_assessment_and_evidence(assessment_id: str) -> tuple[bool, str]:
+    assessment = get_assessment(assessment_id)
+    if not assessment:
+        return False, "Assessment was not found."
+    if assessment.get("status") == "running":
+        return False, "Wait for the active scan to finish before deleting its history."
+    removed = delete_assessment(assessment_id)
+    if not removed:
+        return False, "Assessment was not found."
+    raw_dir = data_dir() / "raw"
+    if raw_dir.is_symlink():
+        return True, "Assessment deleted. Raw files were retained because the configured raw directory is a symbolic link."
+    raw_root = raw_dir.resolve()
+    errors = []
+    for result in removed.get("scanner_results", {}).values():
+        raw_path = result.get("raw_path")
+        if not raw_path:
+            continue
+        parts = PurePosixPath(str(raw_path).replace("\\", "/")).parts
+        if not parts or parts[0].casefold() != "raw":
+            continue
+        candidate = (data_dir() / Path(*parts)).resolve()
+        if candidate.parent != raw_root or not candidate.is_file():
+            continue
+        try:
+            candidate.unlink()
+        except OSError as exc:
+            errors.append(str(exc))
+    return True, "Assessment deleted." + (f" Some raw files could not be removed: {'; '.join(errors)}" if errors else "")
+
+
+def _rerun_from_history(assessment_id: str) -> None:
+    if not st.session_state.get(f"rerun_authorized_{assessment_id}"):
+        return
+    source = get_assessment(assessment_id)
+    if not source:
+        st.session_state["history_rerun_message"] = ("error", "Assessment was not found.")
+        return
+    try:
+        new_id = _start_rescan(source)
+        new_scan = get_assessment(new_id)
+        st.session_state["current_assessment_id"] = new_id
+        st.session_state["history_selected_scan"] = new_id
+        st.session_state["history_rerun_message"] = (
+            "success", f"Started scan run #{new_scan['scan_number']}. It is saved as a separate record in this target's history."
+        )
+    except (KeyError, ValueError, OSError) as exc:
+        st.session_state["history_rerun_message"] = ("error", f"Could not rerun this assessment: {exc}")
+
+
+def _confirm_delete_from_history(assessment_id: str) -> None:
+    if not st.session_state.get(f"confirm_delete_{assessment_id}"):
+        return
+    deleted, message = _delete_assessment_and_evidence(assessment_id)
+    st.session_state.pop("pending_delete_assessment", None)
+    if st.session_state.get("current_assessment_id") == assessment_id:
+        st.session_state.pop("current_assessment_id", None)
+    remaining = list_assessments()
+    if remaining:
+        st.session_state["history_selected_scan"] = remaining[0]["id"]
+    else:
+        st.session_state.pop("history_selected_scan", None)
+    st.session_state["history_delete_message"] = ("success" if deleted else "error", message)
+
+
 def _make_assessment(targets: dict[str, str], scanners: list[str], scan_type: str, ports: str, wordlist: str,
-                     burp_api_url: str, burp_api_key: str, burp_profile: str) -> str:
+                     burp_api_url: str, burp_api_key: str, burp_profile: str, *,
+                     group_id: str | None = None, scan_number: int = 1,
+                     scan_config: dict[str, Any] | None = None) -> str:
     label = " · ".join(f"{name}: {target}" for name, target in targets.items() if target)
-    assessment = new_assessment(label, scanners)
+    assessment = new_assessment(label, scanners, group_id=group_id, scan_number=scan_number, scan_config=scan_config)
     assessment["scanner_results"] = {
         scanner: {"status": "queued", "target": targets["nmap"] if scanner == "nmap" else targets["web"]}
         for scanner in scanners
@@ -49,6 +119,30 @@ def _make_assessment(targets: dict[str, str], scanners: list[str], scan_type: st
     )
     worker.start()
     return assessment["id"]
+
+
+def _start_rescan(source: dict[str, Any]) -> str:
+    scanners = list(source.get("scanners", []))
+    source_results = source.get("scanner_results", {})
+    targets: dict[str, str] = {}
+    for scanner in scanners:
+        target = str(source_results.get(scanner, {}).get("target", "")).strip()
+        if target:
+            targets["nmap" if scanner == "nmap" else "web"] = target
+    if not scanners or any(("nmap" if scanner == "nmap" else "web") not in targets for scanner in scanners):
+        raise ValueError("This assessment does not have enough saved target details to repeat its scans.")
+    if any(source_results.get(scanner, {}).get("mode") == "imported report" for scanner in scanners):
+        raise ValueError("Imported reports do not contain scan configuration to rerun. Start a new scan instead.")
+    settings = load_app_settings()
+    config = source.get("scan_config", {})
+    return _make_assessment(
+        targets, scanners, str(config.get("scan_type", "quick")), str(config.get("ports", "")),
+        str(config.get("wordlist", "")), settings["burp_api_url"], settings["burp_api_key"],
+        str(config.get("burp_profile", "Crawl and Audit - Lightweight")),
+        group_id=str(source.get("group_id", source["id"])),
+        scan_number=next_scan_number(str(source.get("group_id", source["id"]))),
+        scan_config=config,
+    )
 
 
 def _run_assessment_worker(assessment_id: str, targets: dict[str, str], scanners: list[str], scan_type: str,
@@ -152,42 +246,23 @@ def _render_ai(assessment: dict[str, Any]) -> None:
         st.info("Run a scanner successfully before requesting AI analysis.")
         return
     st.subheader("Unified AI assessment")
+    settings = load_app_settings()
+    st.caption(f"Cloud model: **{settings['ai_model']}** · {settings['ai_base_url']}")
     st.caption("One analysis correlates every scanner’s findings and returns a prioritized remediation plan. Recommendations are advisory.")
-    with st.expander("AI connection and privacy", expanded=False):
-        provider = st.selectbox("Provider", ["Ollama (local)", "OpenAI-compatible endpoint"], key="ai_provider")
-        default_base = os.environ.get("SOC_AI_BASE_URL", "http://127.0.0.1:11434") if provider == "Ollama (local)" else os.environ.get("SOC_AI_BASE_URL", "https://api.openai.com")
-        base_url = st.text_input("Base URL", value=default_base, key=f"ai_url_{provider}")
-        default_model = os.environ.get("SOC_AI_MODEL", "llama3.1:8b") if provider == "Ollama (local)" else os.environ.get("SOC_AI_MODEL", "gpt-4o-mini")
-        api_key = ""
-        if provider != "Ollama (local)":
-            api_key = st.text_input(
-                "API key (used for this session only)",
-                value=os.environ.get("SOC_AI_API_KEY", ""), type="password", key="ai_api_key",
-            )
-        models_key = f"available_models_{provider}_{base_url}"
-        available_models = st.session_state.get(models_key, [])
-        model_options = list(dict.fromkeys([*available_models, default_model]))
-        model = st.selectbox("Model", model_options, key=f"ai_model_{provider}") if available_models else st.text_input("Model name", value=default_model, key=f"ai_model_text_{provider}")
-        if st.button("Refresh available models", key=f"refresh_models_{provider}"):
-            available_models = list_models(provider=provider, base_url=base_url, api_key=api_key)
-            st.session_state[models_key] = available_models
-            if available_models:
-                st.success(f"Found {len(available_models)} model(s).")
-            else:
-                st.warning("No models were returned. Check the endpoint, credentials, and service status; you can still enter a model name.")
-            st.rerun()
-        allow_send = st.checkbox("I reviewed the privacy choice and allow sending normalized finding details to this endpoint.", key="ai_allow_send")
-        if provider != "Ollama (local)":
-            st.warning("The selected cloud service will receive normalized findings, evidence, and scanner coverage. Send them only when approved for this data.")
-        else:
-            st.caption("Ollama stays local when its endpoint is on this device. Remote Ollama endpoints may transmit data externally.")
-    if st.button("Analyze all tool results", type="primary", disabled=not allow_send, key="analyze_all"):
+    if not settings["ai_api_key"]:
+        st.warning("Add the cloud provider API key in Settings before running an analysis.")
+    st.warning("The configured online AI service receives normalized findings, scanner evidence, and coverage. Send them only when approved for this data.")
+    allow_send = st.checkbox(
+        "I reviewed the privacy choice and allow sending these assessment results to the configured cloud AI endpoint.",
+        key=f"ai_allow_send_{assessment['id']}",
+    )
+    if st.button("Analyze all tool results", type="primary", disabled=not allow_send or not settings["ai_api_key"], key=f"analyze_all_{assessment['id']}"):
         analyses = assessment.setdefault("analyses", {})
         with st.spinner("Analyzing normalized findings…"):
             try:
                 analyses["unified"] = analyze_assessment(
                     str(assessment.get("target", "")), findings, assessment.get("scanner_results", {}),
-                    provider=provider, base_url=base_url, model=model, api_key=api_key,
+                    base_url=settings["ai_base_url"], model=settings["ai_model"], api_key=settings["ai_api_key"],
                 )
             except AIAnalysisError as exc:
                 analyses["unified"] = f"Analysis unavailable: {exc}"
@@ -330,27 +405,19 @@ def _dashboard_page() -> None:
                 st.caption(detail)
     with models_col:
         with st.container(border=True):
-            st.markdown("#### AI models")
-            provider = st.selectbox("Provider", ["Ollama (local)", "OpenAI-compatible endpoint"], key="dashboard_model_provider")
-            base_default = os.environ.get("SOC_AI_BASE_URL", "http://127.0.0.1:11434") if provider == "Ollama (local)" else os.environ.get("SOC_AI_BASE_URL", "https://api.openai.com")
-            base_url = st.text_input("Endpoint", value=base_default, key=f"dashboard_endpoint_{provider}")
-            api_key = ""
-            if provider != "Ollama (local)":
-                api_key = st.text_input("API key (session only)", value=os.environ.get("SOC_AI_API_KEY", ""), type="password", key="dashboard_api_key")
-            cache_key = f"dashboard_model_list_{provider}_{base_url}"
-            if st.button("Load available models", key="dashboard_load_models"):
-                st.session_state[cache_key] = list_models(provider=provider, base_url=base_url, api_key=api_key)
-            models = st.session_state.get(cache_key, [])
-            if models:
-                st.caption(f"{len(models)} model(s) advertised by this endpoint")
-                st.write(", ".join(models))
-            else:
-                st.caption("Load models to query this endpoint. Configure credentials and choose a model in AI analysis.")
+            st.markdown("#### Online AI model")
+            ai_settings = load_app_settings()
+            st.markdown(f"**{ai_settings['ai_model']}**")
+            st.caption(ai_settings["ai_base_url"])
+            st.caption("API key configured" if ai_settings["ai_api_key"] else "API key not configured")
+            if st.button("Configure cloud AI", key="dashboard_ai_settings",
+                         on_click=_navigate_to, args=("Settings",)):
+                st.rerun(scope="app")
 
     st.markdown("### Recent assessments")
     for assessment in assessments[:5]:
         left, middle, right = st.columns([3, 1, 1])
-        left.write(f"{_format_created(assessment.get('created_at', ''))} · {assessment.get('target', '')}")
+        left.write(f"Run #{assessment.get('scan_number', 1)} · {_format_created(assessment.get('created_at', ''))} · {assessment.get('target', '')}")
         middle.caption(assessment.get("status", "unknown").title())
         if right.button("View", key=f"dashboard_history_{assessment['id']}",
                         on_click=_open_assessment, args=(assessment["id"],)):
@@ -475,6 +542,7 @@ def _new_assessment_page() -> None:
         assessment_id = _make_assessment(
             targets, scanners, scan_type, ports.strip(), wordlist.strip(),
             burp_api_url.strip(), burp_api_key.strip(), burp_profile,
+            scan_config={"scan_type": scan_type, "ports": ports.strip(), "wordlist": wordlist.strip(), "burp_profile": burp_profile},
         )
         st.session_state["current_assessment_id"] = assessment_id
         st.rerun()
@@ -490,8 +558,38 @@ def _new_assessment_page() -> None:
 def _settings_page() -> None:
     st.markdown("<div class='eyebrow'>CONNECTIONS</div>", unsafe_allow_html=True)
     st.title("Settings")
-    st.write("Save the Burp Suite REST API connection once. New assessments will reuse it automatically.")
+    st.write("Configure the cloud AI endpoint and scanner connections used by future assessments.")
     settings = load_app_settings()
+    with st.container(border=True):
+        st.subheader("Online AI analysis")
+        st.caption("Use an HTTPS endpoint that implements the OpenAI chat completions and model-list APIs. The API key is saved locally in the ignored data/app-settings.json file.")
+        ai_base_url = st.text_input("Cloud AI base URL", value=settings["ai_base_url"], key="settings_ai_base_url",
+                                    placeholder="https://api.openai.com")
+        ai_api_key = st.text_input("API key", value=settings["ai_api_key"], type="password", key="settings_ai_api_key")
+        model_cache_key = f"settings_available_models_{ai_base_url}"
+        models = st.session_state.get(model_cache_key, [])
+        if st.button("Load available cloud models", key="settings_load_ai_models"):
+            models = list_models(base_url=ai_base_url, api_key=ai_api_key)
+            st.session_state[model_cache_key] = models
+            if models:
+                st.success(f"Found {len(models)} model(s). Choose one below.")
+            else:
+                st.warning("No models were returned. Check the HTTPS endpoint and API key; you can still enter the exact model name.")
+            st.rerun()
+        model_options = list(dict.fromkeys([*models, settings["ai_model"]]))
+        if models:
+            manual_option = "Enter model name manually…"
+            selected_model = st.selectbox("Model", [*model_options, manual_option], key="settings_ai_model_select")
+            ai_model = st.text_input("Model name", value=settings["ai_model"], key="settings_ai_model_text") if selected_model == manual_option else selected_model
+        else:
+            ai_model = st.text_input("Model name", value=settings["ai_model"], key="settings_ai_model_text")
+        if st.button("Save cloud AI settings", type="primary", key="save_ai_settings"):
+            try:
+                save_ai_settings(ai_base_url.strip(), ai_model, ai_api_key)
+                st.success("Cloud AI settings saved. The API key is stored locally and reused for analysis.")
+            except (OSError, ValueError) as exc:
+                st.error(f"Could not save cloud AI settings: {exc}")
+
     with st.container(border=True):
         st.subheader("Burp Suite REST API")
         st.caption("On the Kali VM, keep Burp's API bound to localhost when Burp and this dashboard run on the same machine. Enter the service root only; the app adds your key and API route.")
@@ -514,21 +612,69 @@ def _settings_page() -> None:
             except OSError as exc:
                 st.error(f"Could not remove saved API key: {exc}")
 
+    if settings["ai_api_key"] and st.button("Forget cloud AI API key", key="forget_ai_api_key"):
+        try:
+            save_ai_settings(settings["ai_base_url"], settings["ai_model"], "")
+            st.success("Cloud AI API key removed from local settings.")
+            st.rerun()
+        except (OSError, ValueError) as exc:
+            st.error(f"Could not remove cloud AI API key: {exc}")
+
 
 def _history_page() -> None:
     st.title("Assessment history")
+    message = st.session_state.pop("history_rerun_message", None)
+    if message:
+        (st.success if message[0] == "success" else st.error)(message[1])
+    message = st.session_state.pop("history_delete_message", None)
+    if message:
+        (st.success if message[0] == "success" else st.error)(message[1])
     assessments = list_assessments()
     if not assessments:
-        st.info("No assessments saved yet. Start one from the New assessment page.")
+        st.info("No assessments saved yet. Start one from the New scan page.")
         return
-    labels = {item["id"]: f"{_format_created(item['created_at'])} · {item['target']} · {item['status']}" for item in assessments}
+    labels = {
+        item["id"]: f"#{item.get('scan_number', 1)} · {_format_created(item['created_at'])} · {item['target']} · {item['status']}"
+        for item in assessments
+    }
     ids = list(labels)
     default_id = st.session_state.get("current_assessment_id", ids[0])
     index = ids.index(default_id) if default_id in ids else 0
-    selected_id = st.selectbox("Saved assessments", ids, index=index, format_func=lambda value: labels[value])
+    selected_id = st.selectbox("Saved scans", ids, index=index, format_func=lambda value: labels[value], key="history_selected_scan")
     assessment = get_assessment(selected_id)
     if assessment:
         st.session_state["current_assessment_id"] = selected_id
+        lineage = list_assessment_scans(assessment.get("group_id", assessment["id"]))
+        st.markdown(f"#### Target scan history · {len(lineage)} run(s)")
+        for scan in lineage:
+            st.caption(f"Run #{scan.get('scan_number', 1)} · {_format_created(scan['created_at'])} · {scan['status'].title()} · {len(scan.get('findings', []))} findings · `{scan['id'][:8]}`")
+
+        action_cols = st.columns(3)
+        imported = any(item.get("mode") == "imported report" for item in assessment.get("scanner_results", {}).values())
+        can_rerun = assessment.get("status") != "running" and not imported and bool(assessment.get("scanners"))
+        rerun_authorized = st.checkbox(
+            "I confirm this target is still authorized for another scan.",
+            key=f"rerun_authorized_{assessment['id']}", disabled=not can_rerun,
+        )
+        action_cols[0].button(
+            "Re-run scan", type="primary", disabled=not (can_rerun and rerun_authorized),
+            key=f"rerun_scan_{assessment['id']}", on_click=_rerun_from_history, args=(assessment["id"],),
+        )
+        if action_cols[2].button("Delete scan", disabled=assessment.get("status") == "running", key=f"request_delete_{assessment['id']}"):
+            st.session_state["pending_delete_assessment"] = assessment["id"]
+            st.rerun()
+        if st.session_state.get("pending_delete_assessment") == assessment["id"]:
+            st.warning("Delete this scan record and its saved raw scanner files? This cannot be undone.")
+            confirm_col, cancel_col = st.columns(2)
+            confirm_delete = st.checkbox("Confirm permanent deletion", key=f"confirm_delete_{assessment['id']}")
+            confirm_col.button(
+                "Permanently delete scan", disabled=not confirm_delete,
+                key=f"confirm_delete_button_{assessment['id']}",
+                on_click=_confirm_delete_from_history, args=(assessment["id"],),
+            )
+            if cancel_col.button("Cancel", key=f"cancel_delete_{assessment['id']}"):
+                st.session_state.pop("pending_delete_assessment", None)
+                st.rerun()
         _render_assessment(assessment)
 
 
