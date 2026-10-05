@@ -17,7 +17,7 @@ from soc_cyber_agent.scanner_runner import SCANNERS, ScannerError, run_scan, sca
 from soc_cyber_agent.tool_catalog import TOOL_CATEGORIES, catalog_tool_status
 from soc_cyber_agent.storage import (
     data_dir, delete_assessment, get_assessment, list_assessment_scans,
-    list_assessments, new_assessment, next_scan_number, recover_interrupted_assessments, save_assessment,
+    list_assessments, new_assessment, next_scan_number, recover_interrupted_assessments, save_analysis, save_assessment,
 )
 
 recover_interrupted_assessments()
@@ -194,8 +194,10 @@ def _run_assessment_worker(assessment_id: str, targets: dict[str, str], scanners
         save_assessment(assessment)
     assessment = get_assessment(assessment_id)
     if assessment:
-        completed = any(item.get("status") == "complete" for item in assessment["scanner_results"].values())
-        assessment["status"] = "complete" if completed else "failed"
+        statuses = [item.get("status") for item in assessment["scanner_results"].values()]
+        completed = sum(status == "complete" for status in statuses)
+        failed = sum(status == "failed" for status in statuses)
+        assessment["status"] = "complete" if completed and not failed else "partial" if completed else "failed"
         save_assessment(assessment)
 
 
@@ -260,16 +262,15 @@ def _render_ai(assessment: dict[str, Any]) -> None:
         key=f"ai_allow_send_{assessment['id']}",
     )
     if st.button("Analyze all tool results", type="primary", disabled=not allow_send or not settings["ai_api_key"], key=f"analyze_all_{assessment['id']}"):
-        analyses = assessment.setdefault("analyses", {})
         with st.spinner("Analyzing normalized findings…"):
             try:
-                analyses["unified"] = analyze_assessment(
+                analysis = analyze_assessment(
                     str(assessment.get("target", "")), findings, assessment.get("scanner_results", {}),
                     base_url=settings["ai_base_url"], model=settings["ai_model"], api_key=settings["ai_api_key"],
                 )
             except AIAnalysisError as exc:
-                analyses["unified"] = f"Analysis unavailable: {exc}"
-            save_assessment(assessment)
+                analysis = f"Analysis unavailable: {exc}"
+            save_analysis(str(assessment["id"]), analysis)
         st.rerun()
     analyses = assessment.get("analyses", {})
     if analyses.get("unified"):
@@ -742,6 +743,10 @@ def _import_reports_page() -> None:
                         scanners.append(scanner)
                         targets.extend(sorted({str(item.target) for item in findings}))
                 except (ReportImportError, OSError) as exc:
+                    for _scanner, _findings, saved_path in imports:
+                        candidate = (data_dir() / Path(*PurePosixPath(saved_path).parts)).resolve()
+                        if candidate.parent == raw_dir.resolve() and candidate.is_file():
+                            candidate.unlink(missing_ok=True)
                     st.error(f"Report import failed: {exc}")
                     return
                 assessment = new_assessment("Imported reports: " + (", ".join(dict.fromkeys(targets)) or "unknown target"), scanners)

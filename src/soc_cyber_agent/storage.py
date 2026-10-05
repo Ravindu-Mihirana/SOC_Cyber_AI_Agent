@@ -80,6 +80,21 @@ def save_assessment(assessment: dict[str, Any]) -> None:
         connection.commit()
 
 
+def save_analysis(assessment_id: str, analysis: str) -> bool:
+    """Update only analysis data so a concurrent scanner save cannot be lost."""
+    with closing(_connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT analyses FROM assessments WHERE id = ?", (assessment_id,)).fetchone()
+        if not row:
+            connection.rollback()
+            return False
+        analyses = json.loads(row["analyses"])
+        analyses["unified"] = analysis
+        connection.execute("UPDATE assessments SET analyses = ? WHERE id = ?", (json.dumps(analyses), assessment_id))
+        connection.commit()
+    return True
+
+
 def _decode(row: sqlite3.Row) -> dict[str, Any]:
     scanner_results = json.loads(row["scanner_results"])
     # Older Windows assessments saved absolute paths. Preserve their report
@@ -146,7 +161,7 @@ def recover_interrupted_assessments() -> int:
             completed = any(result.get("status") == "complete" for result in results.values())
             connection.execute(
                 "UPDATE assessments SET status = ?, scanner_results = ? WHERE id = ?",
-                ("complete" if completed else "failed", json.dumps(results), row["id"]),
+                ("complete" if completed and not any(item.get("status") == "failed" for item in results.values()) else "partial" if completed else "failed", json.dumps(results), row["id"]),
             )
         connection.commit()
     return len(rows)

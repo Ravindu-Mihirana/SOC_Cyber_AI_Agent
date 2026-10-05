@@ -124,18 +124,6 @@ input, execution, and result-normalization adapters are configured. The UI
 shows that distinction explicitly instead of treating an installed binary as
 an active scanner integration.
 
-## Security tool catalog
-
-The dashboard catalog includes web/API scanning, code and dependency analysis,
-cloud and infrastructure checks, network and host monitoring, and enrichment
-and case-management tools. It checks local command availability where possible
-and links each product to its documentation. Nmap, Burp, Nikto, and Gobuster
-have direct scan adapters; OpenVAS/Greenbone reports can be imported. Other
-catalog entries are discovery/planning entries until their scanner-specific
-input, execution, and result-normalization adapters are configured. The UI
-shows that distinction explicitly instead of treating an installed binary as
-an active scanner integration.
-
 ## Burp Suite connection
 
 In Burp Suite, open **Settings → Suite → REST API**, enable the service, and

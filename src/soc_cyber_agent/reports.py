@@ -37,9 +37,11 @@ def render_html(assessment: dict[str, Any]) -> bytes:
         severity = str(item.get("severity", "unknown")).lower()
         asset = str(item.get("host", "")) + (f":{item['port']}" if item.get("port") else "")
         evidence = item.get("evidence")
+        cves = ", ".join(str(value) for value in item.get("cve_ids", []))
+        service = " ".join(str(item.get(field)) for field in ("service_name", "service_product", "service_version") if item.get(field))
         finding_cards.append(f'''<article class="finding"><div class="finding-top"><span class="pill {html.escape(severity)}">{html.escape(severity.upper())}</span><span class="muted">{html.escape(str(item.get("source_tool", "Unknown scanner")))}</span></div>
 <h3>{html.escape(str(item.get("title", "Untitled finding")))}</h3><p>{html.escape(str(item.get("description", "No description provided.")))}</p>
-<div class="asset"><b>Asset</b> {html.escape(asset or "Not specified")}</div>{f'<details><summary>Evidence</summary><pre>{html.escape(str(evidence))}</pre></details>' if evidence else ''}</article>''')
+<div class="asset"><b>Asset</b> {html.escape(asset or "Not specified")}{f' · <b>Service</b> {html.escape(service)}' if service else ''}{f' · <b>CVE</b> {html.escape(cves)}' if cves else ''}</div>{f'<details><summary>Evidence</summary><pre>{html.escape(str(evidence))}</pre></details>' if evidence else ''}</article>''')
     analysis_sections = "".join(f'<section class="analysis"><h3>{html.escape(str(name).title())}</h3><pre>{html.escape(str(content))}</pre></section>' for name, content in analyses.items())
     body = f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Security assessment — {target}</title>
 <style>
@@ -111,6 +113,10 @@ def render_pdf(assessment: dict[str, Any]) -> bytes:
         details = [Paragraph(f"{index}. [{severity}] {title}", styles["ReportFinding"]),
                    Paragraph(f"<b>Scanner:</b> {escape(str(item.get('source_tool', 'Unknown')))} &nbsp; <b>Asset:</b> {escape(asset or 'Not specified')}", styles["ReportCell"]),
                    Paragraph(escape(str(item.get("description", "No description provided."))), styles["ReportCell"])]
+        service = " ".join(str(item.get(field)) for field in ("service_name", "service_product", "service_version") if item.get(field))
+        cves = ", ".join(str(value) for value in item.get("cve_ids", []))
+        if service or cves:
+            details.append(Paragraph(f"<b>Service:</b> {escape(service or 'Not specified')} &nbsp; <b>CVE:</b> {escape(cves or 'None listed')}", styles["ReportCell"]))
         if item.get("evidence"):
             details.append(Paragraph(f"<b>Evidence:</b> {escape(str(item['evidence']))}", styles["ReportEvidence"]))
         story.append(KeepTogether(details))

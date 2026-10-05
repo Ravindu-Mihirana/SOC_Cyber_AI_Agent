@@ -1,6 +1,7 @@
 """Background agent that ingests exported scanner reports from a drop folder."""
 
 import shutil
+import hashlib
 import threading
 import time
 from pathlib import Path
@@ -99,11 +100,23 @@ def _ingest(path: Path) -> None:
         return
 
     content = path.read_bytes()
+    digest = hashlib.sha256(content).hexdigest()
+    processed_dir = inbox_dir() / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    # Content-based archive naming makes retries after a partial move/save
+    # failure idempotent and preserves the report's original bytes.
+    archived = data_dir() / "raw" / f"agent-{scanner}-{digest}.xml"
+    destination = processed_dir / f"{path.stem}-{digest[:10]}{path.suffix}"
+    if destination.exists():
+        path.unlink(missing_ok=True)
+        return
+    if archived.exists():
+        shutil.move(str(path), str(destination))
+        return
     report_id = str(uuid4())
     findings = parser(content, raw_ref=report_id)
     raw_dir = data_dir() / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
-    archived = raw_dir / f"agent-{scanner}-{report_id}.xml"
     shutil.copy2(path, archived)
 
     targets = sorted({finding.target for finding in findings})
@@ -115,11 +128,6 @@ def _ingest(path: Path) -> None:
         "raw_path": archived.relative_to(data_dir()).as_posix(), "mode": "automatically imported report",
     }
     save_assessment(assessment)
-    processed_dir = inbox_dir() / "processed"
-    processed_dir.mkdir(parents=True, exist_ok=True)
-    destination = processed_dir / path.name
-    if destination.exists():
-        destination = processed_dir / f"{path.stem}-{report_id[:8]}{path.suffix}"
     shutil.move(str(path), str(destination))
     with _lock:
         _state["processed"] += 1
