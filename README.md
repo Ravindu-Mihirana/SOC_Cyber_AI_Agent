@@ -117,8 +117,10 @@ Greenbone server over GMP.
 The dashboard catalog includes web/API scanning, code and dependency analysis,
 cloud and infrastructure checks, network and host monitoring, and enrichment
 and case-management tools. It checks local command availability where possible
-and links each product to its documentation. Nmap, Burp, Nikto, and Gobuster
-have direct scan adapters; OpenVAS/Greenbone reports can be imported. Other
+and links each product to its documentation. Nmap, Burp, Nikto, Gobuster, OWASP
+ZAP, Nuclei, ffuf, and sqlmap have direct scan adapters; OpenVAS/Greenbone
+reports can be imported. Nuclei and ffuf use conservative request limits.
+ZAP Quick Start and sqlmap send active probes and require explicit authorization. Other
 catalog entries are discovery/planning entries until their scanner-specific
 input, execution, and result-normalization adapters are configured. The UI
 shows that distinction explicitly instead of treating an installed binary as

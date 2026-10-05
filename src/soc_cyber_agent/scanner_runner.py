@@ -20,7 +20,7 @@ from .report_importers import _cves
 from .storage import data_dir
 from .web_parsers import parse_gobuster_text, parse_nikto_json, parse_nikto_text
 
-SCANNERS = ("nmap", "burp", "nikto", "gobuster")
+SCANNERS = ("nmap", "burp", "nikto", "gobuster", "zap", "nuclei", "ffuf", "sqlmap")
 
 
 class ScannerError(RuntimeError):
@@ -43,11 +43,19 @@ def scanner_availability() -> dict[str, tuple[bool, str]]:
     gobuster = shutil.which("gobuster")
     nikto = _nikto_command()
     burp_configured = bool(os.environ.get("BURP_API_URL") and os.environ.get("BURP_API_KEY"))
+    zap = shutil.which("zaproxy") or shutil.which("zap.sh") or shutil.which("zap.bat")
+    nuclei = shutil.which("nuclei")
+    ffuf = shutil.which("ffuf")
+    sqlmap = shutil.which("sqlmap") or shutil.which("sqlmap.py")
     return {
         "nmap": (bool(nmap), nmap or "Nmap executable not found on PATH"),
         "burp": (burp_configured, os.environ.get("BURP_API_URL", "Configure Burp REST API URL and key in the assessment form")),
         "nikto": (bool(nikto), " ".join(nikto) if nikto else "Install Nikto and Perl; set NIKTO_SCRIPT if using nikto.pl"),
         "gobuster": (bool(gobuster), gobuster or "Gobuster executable not found on PATH"),
+        "zap": (bool(zap), zap or "ZAP executable not found on PATH"),
+        "nuclei": (bool(nuclei), nuclei or "Nuclei executable not found on PATH"),
+        "ffuf": (bool(ffuf), ffuf or "ffuf executable not found on PATH"),
+        "sqlmap": (bool(sqlmap), sqlmap or "sqlmap executable not found on PATH"),
     }
 
 
@@ -208,6 +216,80 @@ def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api
     return findings, raw_path, str(task_id)
 
 
+def _web_finding(scanner: str, target: str, job_id: str, index: int, *, title: str,
+                 description: str = "", severity: str = "unknown", evidence: str = "",
+                 location: str = "") -> Finding:
+    parsed = urlparse(location or target)
+    severity = severity.lower()
+    if severity in {"informational", "information"}:
+        severity = "info"
+    if severity not in {"info", "low", "medium", "high", "critical", "unknown"}:
+        severity = "unknown"
+    return Finding(
+        id=f"{job_id}:{scanner}:{index}", source_tool=scanner, target=target,
+        host=parsed.hostname or urlparse(target).hostname or target,
+        port=parsed.port or (443 if parsed.scheme == "https" else 80),
+        protocol=parsed.scheme or urlparse(target).scheme or None,
+        title=title[:240], description=description[:6000], severity=severity,
+        cve_ids=_cves(f"{title} {description} {evidence}"), evidence=evidence[:20000],
+        raw_ref=job_id, timestamp=datetime.now(timezone.utc), service_name=location or None,
+    )
+
+
+def _parse_nuclei(path: Path, target: str, job_id: str) -> list[Finding]:
+    findings = []
+    for index, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines()):
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        info = item.get("info") or {}
+        classification = info.get("classification") or {}
+        cves = classification.get("cve-id") or classification.get("cve") or []
+        title = str(info.get("name") or item.get("template-id") or "Nuclei finding")
+        description = str(info.get("description") or "")
+        finding = _web_finding("nuclei", target, job_id, index, title=title,
+                               description=description, severity=str(info.get("severity", "unknown")),
+                               evidence=json.dumps(item, ensure_ascii=False), location=str(item.get("matched-at") or item.get("host") or target))
+        finding.cve_ids = sorted(set(finding.cve_ids + [str(value) for value in (cves if isinstance(cves, list) else [cves])]))
+        findings.append(finding)
+    return findings
+
+
+def _parse_ffuf(path: Path, target: str, job_id: str) -> list[Finding]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows = data.get("results", []) if isinstance(data, dict) else []
+    findings = []
+    for index, item in enumerate(rows):
+        url = str(item.get("url") or target)
+        status = item.get("status", "unknown")
+        finding = _web_finding("ffuf", target, job_id, index,
+                               title=f"Content discovered: {url}",
+                               description=f"ffuf received HTTP status {status}; review the resource manually.",
+                               severity="info", evidence=json.dumps(item, ensure_ascii=False), location=url)
+        findings.append(finding)
+    return findings
+
+
+def _parse_zap(path: Path, target: str, job_id: str) -> list[Finding]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    sites = data.get("site", []) if isinstance(data, dict) else []
+    findings = []
+    for site in sites:
+        for alert in site.get("alerts", []):
+            instances = alert.get("instances") or [{}]
+            for instance in instances:
+                index = len(findings)
+                findings.append(_web_finding(
+                    "zap", target, job_id, index, title=str(alert.get("name") or "ZAP alert"),
+                    description=str(alert.get("desc") or alert.get("description") or ""),
+                    severity={"3": "high", "2": "medium", "1": "low", "0": "info"}.get(str(alert.get("riskcode")), "unknown"),
+                    evidence="\n".join(str(instance.get(key, "")) for key in ("uri", "method", "evidence", "attack", "other") if instance.get(key)),
+                    location=str(instance.get("uri") or site.get("@name") or target),
+                ))
+    return findings
+
+
 def run_scan(
     scanner: str,
     target: str,
@@ -289,7 +371,7 @@ def run_scan(
             if not log_path.is_file():
                 raise ScannerError("Nikto completed without producing a JSON report or console output.")
             raw_path = log_path
-    else:
+    elif scanner == "gobuster":
         _check_url(target)
         executable = shutil.which("gobuster")
         if not executable:
@@ -301,4 +383,53 @@ def run_scan(
         args = [executable, "dir", "-u", target, "-w", str(wordlist_path.resolve()), "-t", "10", "-q", "-o", str(raw_path)]
         _run(args, timeout=1800)
         findings = parse_gobuster_text(raw_path, target=target, job_id=job_id)
+    elif scanner == "nuclei":
+        _check_url(target)
+        executable = shutil.which("nuclei")
+        if not executable:
+            raise ScannerError("Nuclei executable was not found on PATH.")
+        raw_path = raw_dir / f"{job_id}-nuclei.jsonl"
+        args = [executable, "-u", target, "-jsonl", "-o", str(raw_path), "-rl", "10", "-timeout", "5", "-retries", "1", "-no-color"]
+        _run(args, timeout=1800)
+        findings = _parse_nuclei(raw_path, target, job_id)
+    elif scanner == "ffuf":
+        _check_url(target)
+        executable = shutil.which("ffuf")
+        if not executable:
+            raise ScannerError("ffuf executable was not found on PATH.")
+        wordlist_path = Path(wordlist).expanduser()
+        if not wordlist_path.is_file():
+            raise ScannerError("Choose an existing local wordlist file for ffuf.")
+        raw_path = raw_dir / f"{job_id}-ffuf.json"
+        fuzz_url = target.rstrip("/") + "/FUZZ"
+        args = [executable, "-u", fuzz_url, "-w", str(wordlist_path.resolve()), "-of", "json", "-o", str(raw_path), "-rate", "10", "-t", "10", "-maxtime", "1800", "-noninteractive"]
+        _run(args, timeout=1900)
+        findings = _parse_ffuf(raw_path, target, job_id)
+    elif scanner == "zap":
+        _check_url(target)
+        executable = shutil.which("zaproxy") or shutil.which("zap.sh") or shutil.which("zap.bat")
+        if not executable:
+            raise ScannerError("OWASP ZAP executable was not found on PATH.")
+        raw_path = raw_dir / f"{job_id}-zap.json"
+        _run([executable, "-cmd", "-quickurl", target, "-quickout", str(raw_path)], timeout=3600)
+        findings = _parse_zap(raw_path, target, job_id)
+    elif scanner == "sqlmap":
+        _check_url(target)
+        executable = shutil.which("sqlmap") or shutil.which("sqlmap.py")
+        if not executable:
+            raise ScannerError("sqlmap executable was not found on PATH.")
+        output_dir = raw_dir / f"{job_id}-sqlmap"
+        completed = _run([executable, "-u", target, "--batch", "--smart", "--risk=1", "--level=1", "--crawl=1", "--output-dir", str(output_dir)], timeout=3600, allow_nonzero=True)
+        raw_path = raw_dir / f"{job_id}-sqlmap.txt"
+        output = (completed.stdout or "") + "\n" + (completed.stderr or "")
+        raw_path.write_text(output, encoding="utf-8", errors="replace")
+        if completed.returncode != 0 and "sqlmap identified the following injection point" not in output.lower():
+            raise ScannerError(f"sqlmap exited with code {completed.returncode}: {output[-2000:]}")
+        findings = []
+        marker = "sqlmap identified the following injection point"
+        if marker in output.lower():
+            findings.append(_web_finding("sqlmap", target, job_id, 0,
+                                         title="Potential SQL injection confirmed by sqlmap",
+                                         description="sqlmap reported an injection point. Validate the parameter and impact from the complete raw output.",
+                                         severity="high", evidence=output[-20000:], location=target))
     return [finding.to_dict() for finding in findings], raw_path.relative_to(data_dir()).as_posix()

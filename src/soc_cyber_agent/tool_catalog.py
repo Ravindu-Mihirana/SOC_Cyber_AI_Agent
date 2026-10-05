@@ -8,11 +8,11 @@ TOOL_CATEGORIES: tuple[dict[str, Any], ...] = (
     {
         "name": "Web and API scanning",
         "tools": (
-            {"name": "OWASP ZAP", "summary": "DAST, API import, spidering, and active/passive web checks.", "url": "https://www.zaproxy.org/docs/automate/automation-framework/", "binaries": ("zap.sh", "zap.bat", "zaproxy")},
-            {"name": "Nuclei", "summary": "Template-based checks for web, API, network, DNS, and cloud findings.", "url": "https://docs.projectdiscovery.io/tools/nuclei/overview", "binaries": ("nuclei",)},
-            {"name": "ffuf", "summary": "Web content, virtual-host, and parameter discovery.", "url": "https://github.com/ffuf/ffuf", "binaries": ("ffuf",)},
+            {"name": "OWASP ZAP", "summary": "DAST, API import, spidering, and active/passive web checks.", "url": "https://www.zaproxy.org/docs/automate/automation-framework/", "integration": "zap"},
+            {"name": "Nuclei", "summary": "Template-based checks for web, API, network, DNS, and cloud findings.", "url": "https://docs.projectdiscovery.io/tools/nuclei/overview", "integration": "nuclei"},
+            {"name": "ffuf", "summary": "Web content, virtual-host, and parameter discovery.", "url": "https://github.com/ffuf/ffuf", "integration": "ffuf"},
             {"name": "testssl.sh", "summary": "TLS versions, ciphers, certificates, and common TLS weaknesses.", "url": "https://github.com/testssl/testssl.sh", "binaries": ("testssl.sh", "testssl")},
-            {"name": "sqlmap", "summary": "Focused SQL injection testing for authorized applications.", "url": "https://github.com/sqlmapproject/sqlmap", "binaries": ("sqlmap",)},
+            {"name": "sqlmap", "summary": "Focused SQL injection testing for authorized applications.", "url": "https://github.com/sqlmapproject/sqlmap", "integration": "sqlmap"},
             {"name": "Nmap", "summary": "Host, port, and optional service-version discovery.", "integration": "nmap"},
             {"name": "Burp Suite", "summary": "Web crawl and audit through Burp's REST API.", "integration": "burp"},
             {"name": "Nikto", "summary": "Web-server configuration and known-file checks.", "integration": "nikto"},

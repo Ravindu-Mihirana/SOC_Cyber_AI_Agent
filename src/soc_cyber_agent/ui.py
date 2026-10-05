@@ -485,23 +485,28 @@ def _new_assessment_page() -> None:
             "burp": "Web crawl and vulnerability audit through Burp Suite",
             "nikto": "Web server checks",
             "gobuster": "Discover web paths from a wordlist",
+            "zap": "ZAP Quick Start web scan",
+            "nuclei": "Rate-limited template-based checks",
+            "ffuf": "Rate-limited web path discovery",
+            "sqlmap": "Focused SQL injection checks (active probes)",
         }
         for index, (col, name) in enumerate(zip(scanner_cols, SCANNERS)):
-            ready, _ = availability[name]
+            ready, detail = availability[name]
             if name == "burp":
                 ready = bool(burp_settings["burp_api_url"] and burp_settings["burp_api_key"])
+                detail = burp_settings["burp_api_url"] if ready else "Configure in Settings"
             with col:
                 with st.container(border=True):
                     chosen = st.checkbox(name.title(), value=(name == "nmap"), key=f"scan_select_{name}")
                     st.caption(descriptions[name])
-                    st.caption("Ready" if ready else "Configure in Settings" if name == "burp" else "Tool not detected")
+                    st.caption(f"Ready · {detail}" if ready else detail)
             if chosen:
                 selected.append(name)
         scanners = selected
         st.markdown("#### 2 · Set target and scan options")
         col_nmap, col_web = st.columns(2)
         nmap_target = col_nmap.text_input("Nmap hostname or IP", placeholder="192.0.2.10")
-        web_target = col_web.text_input("Web target URL (Burp / Nikto / Gobuster)", placeholder="https://authorized.example")
+        web_target = col_web.text_input("Web target URL (web scanners)", placeholder="https://authorized.example")
         burp_api_url = burp_settings["burp_api_url"]
         burp_api_key = burp_settings["burp_api_key"]
         burp_profile = "Crawl and Audit - Lightweight"
@@ -538,7 +543,9 @@ def _new_assessment_page() -> None:
                     st.caption(f"Burp will run Crawl and Audit using: {burp_profile}")
         scan_type = st.selectbox("Nmap profile", ["quick", "version"], help="Quick scans common ports; version attempts service detection on the top 100 ports.")
         ports = st.text_input("Optional Nmap ports", placeholder="e.g. 80,443 or 1-1000")
-        wordlist = st.text_input("Gobuster wordlist path", placeholder="/path/to/wordlist.txt")
+        wordlist = st.text_input("Wordlist path (Gobuster / ffuf)", placeholder="/path/to/wordlist.txt")
+        if any(name in scanners for name in ("zap", "sqlmap")):
+            st.warning("ZAP Quick Start and sqlmap send active test requests to the target. Use only on applications you are authorized to test.")
         approved = st.checkbox("I own these targets or have explicit permission to scan them.")
         submitted = st.form_submit_button("Start authorized assessment", type="primary", use_container_width=True)
     if submitted:
@@ -554,7 +561,8 @@ def _new_assessment_page() -> None:
                 st.error("Enter a hostname or IP address for Nmap.")
                 return
             targets["nmap"] = nmap_target.strip()
-        if any(name in scanners for name in ("burp", "nikto", "gobuster")):
+        web_scanners = {"burp", "nikto", "gobuster", "zap", "nuclei", "ffuf", "sqlmap"}
+        if any(name in scanners for name in web_scanners):
             if not web_target.strip():
                 st.error("Enter an http(s) URL for the web scanners.")
                 return
@@ -562,8 +570,8 @@ def _new_assessment_page() -> None:
         if "burp" in scanners and not burp_api_key.strip():
             st.error("Configure Burp's REST API URL and key on the Settings page before starting a Burp scan.")
             return
-        if "gobuster" in scanners and not wordlist.strip():
-            st.error("Enter an existing local wordlist path for Gobuster.")
+        if any(name in scanners for name in ("gobuster", "ffuf")) and not wordlist.strip():
+            st.error("Enter an existing local wordlist path for Gobuster or ffuf.")
             return
         missing = [name for name in scanners if name != "burp" and not availability[name][0]]
         if missing:
