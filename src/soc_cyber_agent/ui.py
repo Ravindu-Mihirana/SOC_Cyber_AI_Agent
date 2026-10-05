@@ -17,8 +17,10 @@ from soc_cyber_agent.scanner_runner import SCANNERS, ScannerError, run_scan, sca
 from soc_cyber_agent.tool_catalog import TOOL_CATEGORIES, catalog_tool_status
 from soc_cyber_agent.storage import (
     data_dir, delete_assessment, get_assessment, list_assessment_scans,
-    list_assessments, new_assessment, next_scan_number, save_assessment,
+    list_assessments, new_assessment, next_scan_number, recover_interrupted_assessments, save_assessment,
 )
+
+recover_interrupted_assessments()
 
 
 def _format_created(value: str) -> str:

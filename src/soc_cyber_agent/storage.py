@@ -132,6 +132,26 @@ def list_assessments(limit: int = 100) -> list[dict[str, Any]]:
     return [_decode(row) for row in rows]
 
 
+def recover_interrupted_assessments() -> int:
+    """Mark scans left active by a prior process as interrupted after startup."""
+    with closing(_connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute("SELECT id, scanner_results FROM assessments WHERE status = 'running'").fetchall()
+        for row in rows:
+            results = json.loads(row["scanner_results"])
+            for name, result in results.items():
+                if result.get("status") in {"queued", "running"}:
+                    result["status"] = "failed"
+                    result["error"] = "Scan was interrupted when the application stopped. Start a new scan to retry."
+            completed = any(result.get("status") == "complete" for result in results.values())
+            connection.execute(
+                "UPDATE assessments SET status = ?, scanner_results = ? WHERE id = ?",
+                ("complete" if completed else "failed", json.dumps(results), row["id"]),
+            )
+        connection.commit()
+    return len(rows)
+
+
 def list_assessment_scans(group_id: str) -> list[dict[str, Any]]:
     """Return every saved run in one target's scan lineage, oldest first."""
     with closing(_connect()) as connection:
