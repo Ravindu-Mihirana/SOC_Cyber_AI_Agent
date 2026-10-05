@@ -13,7 +13,7 @@ from soc_cyber_agent.ai_analyzer import AIAnalysisError, analyze_assessment, lis
 from soc_cyber_agent.reports import render_html, render_pdf
 from soc_cyber_agent.report_importers import ReportImportError, parse_burp_xml, parse_openvas_xml
 from soc_cyber_agent.report_agent import agent_status, start_report_agent, stop_report_agent
-from soc_cyber_agent.scanner_runner import SCANNERS, ScannerError, run_scan, scanner_availability
+from soc_cyber_agent.scanner_runner import SCANNERS, ScannerError, normalize_burp_seed, run_scan, scanner_availability
 from soc_cyber_agent.tool_catalog import TOOL_CATEGORIES, catalog_tool_status
 from soc_cyber_agent.storage import (
     data_dir, delete_assessment, get_assessment, list_assessment_scans,
@@ -141,7 +141,7 @@ def _start_rescan(source: dict[str, Any]) -> str:
     return _make_assessment(
         targets, scanners, str(config.get("scan_type", "quick")), str(config.get("ports", "")),
         str(config.get("wordlist", "")), settings["burp_api_url"], settings["burp_api_key"],
-        str(config.get("burp_profile", "Crawl and Audit - Lightweight")),
+        "" if config.get("burp_profile") == "Crawl and Audit - Lightweight" else str(config.get("burp_profile", "")),
         group_id=str(source.get("group_id", source["id"])),
         scan_number=next_scan_number(str(source.get("group_id", source["id"]))),
         scan_config=config,
@@ -509,41 +509,32 @@ def _new_assessment_page() -> None:
         st.markdown("#### 2 · Set target and scan options")
         col_nmap, col_web = st.columns(2)
         nmap_target = col_nmap.text_input("Nmap hostname or IP", placeholder="192.0.2.10")
-        web_target = col_web.text_input("Web target URL (web scanners)", placeholder="https://authorized.example")
+        web_target = col_web.text_input("Web target URL (web scanners)", placeholder="https://authorized.example/",
+                                        help="Enter the full URL including http:// or https://. For Burp, use the final redirect destination and omit any #fragment.")
         burp_api_url = burp_settings["burp_api_url"]
         burp_api_key = burp_settings["burp_api_key"]
-        burp_profile = "Crawl and Audit - Lightweight"
+        burp_profile = ""
         if "burp" in scanners:
             with st.expander("Burp Suite connection and scan profile", expanded=True):
                 if burp_api_key:
                     st.success(f"Using saved Burp connection · {burp_api_url}")
                 else:
                     st.warning("Burp connection is not configured. Add its service URL and API key on the Settings page.")
-                burp_modes = {
-                    "Lightweight": "Crawl and Audit - Lightweight",
-                    "Fast": "Crawl and Audit - Fast",
-                    "Balanced": "Crawl and Audit - Balanced",
-                    "Deep": "Crawl and Audit - Deep",
-                    "Custom": "",
-                }
                 burp_mode = st.selectbox(
-                    "Burp Crawl & Audit configuration",
-                    options=list(burp_modes),
-                    index=0,
-                    help="Choose how much time Burp spends crawling the site and auditing for vulnerabilities.",
+                    "Burp scan configuration",
+                    options=["Use Burp default", "Choose a named configuration"],
+                    help="Use Burp's configured default, or enter the exact configuration name available in this Burp installation.",
                     key="burp_scan_mode",
                 )
-                if burp_mode == "Custom":
+                if burp_mode == "Choose a named configuration":
                     burp_profile = st.text_input(
-                        "Saved custom configuration name",
-                        placeholder="Enter the exact configuration name from Burp",
-                        help="Import or save your custom configuration in Burp, then enter its exact name here.",
+                        "Exact configuration name from Burp",
+                        placeholder="For example, a name shown in Burp's REST API documentation",
+                        help="Names vary by Burp edition and installation. Leave this mode unselected to use Burp's default.",
                         key="burp_custom_profile",
                     ).strip()
-                    st.caption("Custom configurations must already exist in Burp's configuration library.")
                 else:
-                    burp_profile = burp_modes[burp_mode]
-                    st.caption(f"Burp will run Crawl and Audit using: {burp_profile}")
+                    st.caption("No guessed scan configuration is sent; Burp uses its own default configuration.")
         scan_type = st.selectbox("Nmap profile", ["quick", "version"], help="Quick scans common ports; version attempts service detection on the top 100 ports.")
         ports = st.text_input("Optional Nmap ports", placeholder="e.g. 80,443 or 1-1000")
         wordlist = st.text_input("Wordlist path (Gobuster / ffuf)", placeholder="/path/to/wordlist.txt")
@@ -569,7 +560,11 @@ def _new_assessment_page() -> None:
             if not web_target.strip():
                 st.error("Enter an http(s) URL for the web scanners.")
                 return
-            targets["web"] = web_target.strip()
+            try:
+                targets["web"] = normalize_burp_seed(web_target) if "burp" in scanners else web_target.strip()
+            except ScannerError as exc:
+                st.error(str(exc))
+                return
         if "burp" in scanners and not burp_api_key.strip():
             st.error("Configure Burp's REST API URL and key on the Settings page before starting a Burp scan.")
             return

@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from .models import Finding
@@ -63,6 +63,28 @@ def _check_url(target: str) -> None:
     parsed = urlparse(target)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
         raise ScannerError("Web scanner target must be an http(s) URL without embedded credentials.")
+
+
+def normalize_burp_seed(target: str) -> str:
+    """Validate a single absolute Burp seed and canonicalize its origin/path."""
+    value = target.strip()
+    try:
+        parsed = urlparse(value)
+        port = parsed.port  # access validates malformed/out-of-range ports
+    except ValueError as exc:
+        raise ScannerError(f"Invalid Burp seed URL: {exc}") from exc
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise ScannerError("Burp seed must be an absolute http(s) URL, such as https://example.com/.")
+    if any(character.isspace() for character in value) or any(ord(character) < 32 for character in value):
+        raise ScannerError("Burp seed URL cannot contain spaces or control characters. URL-encode spaces in paths.")
+    if parsed.fragment:
+        raise ScannerError("Burp seed URLs with # fragments are not supported by this scanner setup. Enter the page URL without the fragment.")
+    host = parsed.hostname.encode("idna").decode("ascii")
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = host + (f":{port}" if port is not None else "")
+    path = parsed.path or "/"
+    return urlunparse((parsed.scheme.lower(), netloc, path, parsed.params, parsed.query, ""))
 
 
 def _run(args: list[str], *, timeout: int, allow_nonzero: bool = False) -> subprocess.CompletedProcess[str]:
@@ -151,7 +173,7 @@ def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api
                    profile: str = "", on_progress: Callable[[str], None] | None = None,
                    timeout: int = 7200) -> tuple[list[Finding], Path, str]:
     """Start and monitor a Burp scan, then persist the API's raw issue response."""
-    _check_url(target)
+    target = normalize_burp_seed(target)
     parsed_api = urlparse(api_url)
     if parsed_api.scheme not in {"http", "https"} or not parsed_api.hostname or parsed_api.username or parsed_api.password:
         raise ScannerError("Burp REST API URL must be an http(s) URL without embedded credentials.")
