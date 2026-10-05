@@ -399,14 +399,17 @@ def _dashboard_page() -> None:
             st.markdown("#### Available tools")
             availability = scanner_availability()
             burp = load_app_settings()
-            for name in SCANNERS:
-                ready, detail = availability[name]
-                if name == "burp":
-                    ready = bool(burp["burp_api_url"] and burp["burp_api_key"])
-                    detail = burp["burp_api_url"] if ready else "Configure REST API in Settings"
-                badge = "Ready" if ready else "Setup needed"
-                st.markdown(f"**{name.title()}** · {badge}")
-                st.caption(detail)
+            for start in range(0, len(SCANNERS), 3):
+                tool_cols = st.columns(3)
+                for col, name in zip(tool_cols, SCANNERS[start:start + 3]):
+                    ready, detail = availability[name]
+                    if name == "burp":
+                        ready = bool(burp["burp_api_url"] and burp["burp_api_key"])
+                        detail = burp["burp_api_url"] if ready else "Configure REST API in Settings"
+                    with col:
+                        with st.container(border=True):
+                            st.markdown(f"**{name.title()}**")
+                            st.caption(f"🟢 Ready · {detail}" if ready else f"🟠 Setup needed · {detail}")
     with models_col:
         with st.container(border=True):
             st.markdown("#### Online AI model")
