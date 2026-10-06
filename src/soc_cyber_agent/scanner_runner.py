@@ -7,6 +7,7 @@ import subprocess
 import uuid
 import json
 import time
+import socket
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -214,8 +215,20 @@ def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api
         if on_progress and progress is not None and progress != last_progress:
             on_progress(f"Burp scan {task_id} · crawl and audit {progress}%")
             last_progress = progress
-        if state in {"failed", "cancelled", "canceled", "aborted"}:
-            raise ScannerError(f"Burp scan {task_id} ended with status: {state}.")
+        if state in {"failed", "cancelled", "canceled", "aborted", "paused"}:
+            detail = ""
+            for field in ("error", "message", "scan_errors", "errors", "scan_message"):
+                value = status.get(field)
+                if value:
+                    detail = json.dumps(value, ensure_ascii=False) if isinstance(value, (dict, list)) else str(value)
+                    break
+            if state == "paused" and (not detail or "seed" in detail.casefold()):
+                detail = (detail + " " if detail else "") + (
+                    "Burp could not connect to any seed URLs. Verify DNS resolution, outbound network access, "
+                    "TLS/certificate trust, and redirects from the machine running Burp. If the site redirects "
+                    "to another hostname, use that final URL and include it in the authorized scan scope."
+                )
+            raise ScannerError(f"Burp scan {task_id} ended with status: {state}. {detail}".strip())
         if state in {"succeeded", "completed", "complete", "finished"} or str(progress) == "100":
             break
         time.sleep(3)
@@ -312,6 +325,13 @@ def _parse_zap(path: Path, target: str, job_id: str) -> list[Finding]:
     return findings
 
 
+def _free_local_port() -> int:
+    """Reserve an available loopback port number for a one-shot ZAP process."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 def run_scan(
     scanner: str,
     target: str,
@@ -322,6 +342,7 @@ def run_scan(
     burp_api_url: str = "http://127.0.0.1:1337",
     burp_api_key: str = "",
     burp_profile: str = "",
+    nmap_options: dict[str, object] | None = None,
     on_progress: Callable[[str], None] | None = None,
 ) -> tuple[list[dict[str, object]], str]:
     """Execute one scan and return normalized findings plus the raw-output path."""
@@ -350,7 +371,28 @@ def run_scan(
             raise ScannerError("Ports may contain only digits, commas, and hyphens.")
         raw_path = raw_dir / f"{job_id}-nmap.xml"
         args = [executable, "-oX", str(raw_path)]
-        args += ["-T3", "-F"] if scan_type == "quick" else ["-T3", "-sV", "--top-ports", "100"]
+        options = nmap_options or {}
+        timing = str(options.get("timing", "T3"))
+        if timing not in {"T0", "T1", "T2", "T3", "T4", "T5"}:
+            raise ScannerError("Nmap timing must be between T0 and T5.")
+        args += [f"-{timing}"]
+        args += ["-F"] if scan_type == "quick" else ["--top-ports", "100"]
+        if scan_type == "version":
+            args.append("-sV")
+        allowed_nmap_flags = {
+            "service_version": "-sV", "os_detection": "-O", "default_scripts": "-sC",
+            "udp_scan": "-sU", "skip_host_discovery": "-Pn", "open_only": "--open",
+            "tcp_connect": "-sT", "syn_scan": "-sS",
+        }
+        requested_flags = options.get("flags", [])
+        if not isinstance(requested_flags, list) or any(flag not in allowed_nmap_flags for flag in requested_flags):
+            raise ScannerError("Nmap options include an unsupported flag.")
+        if "tcp_connect" in requested_flags and "syn_scan" in requested_flags:
+            raise ScannerError("Choose either TCP connect or SYN scan, not both.")
+        for flag in requested_flags:
+            value = allowed_nmap_flags[flag]
+            if value not in args:
+                args.append(value)
         if ports:
             args += ["-p", ports]
         args.append(target)
@@ -433,7 +475,16 @@ def run_scan(
         if not executable:
             raise ScannerError("OWASP ZAP executable was not found on PATH.")
         raw_path = raw_dir / f"{job_id}-zap.json"
-        _run([executable, "-cmd", "-quickurl", target, "-quickout", str(raw_path)], timeout=3600)
+        proxy_port = _free_local_port()
+        completed = _run([executable, "-cmd", "-silent", "-port", str(proxy_port), "-quickurl", target, "-quickout", str(raw_path)], timeout=3600, allow_nonzero=True)
+        if completed.returncode != 0:
+            detail = (completed.stderr or completed.stdout or "No output from ZAP.").strip()
+            raise ScannerError(f"ZAP exited with code {completed.returncode} using proxy port {proxy_port}: {detail[-2500:]}")
+        if not raw_path.is_file():
+            detail = (completed.stderr or completed.stdout or "ZAP exited without creating its JSON report.").strip()
+            if "address already in use" in detail.casefold():
+                detail += " The chosen local proxy port was occupied; close the competing proxy and retry."
+            raise ScannerError(f"ZAP produced no report on proxy port {proxy_port}: {detail[-2500:]}")
         findings = _parse_zap(raw_path, target, job_id)
     elif scanner == "sqlmap":
         _check_url(target)

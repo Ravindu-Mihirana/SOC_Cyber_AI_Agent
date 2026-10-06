@@ -22,6 +22,17 @@ from soc_cyber_agent.storage import (
 
 recover_interrupted_assessments()
 
+KALI_WEB_WORDLISTS = {
+    "DirB · common": "/usr/share/wordlists/dirb/common.txt",
+    "DirB · big": "/usr/share/wordlists/dirb/big.txt",
+    "DirB · alternate package path": "/usr/share/dirb/wordlists/common.txt",
+    "DirBuster · small": "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt",
+    "DirBuster · medium": "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt",
+    "SecLists · common": "/usr/share/seclists/Discovery/Web-Content/common.txt",
+    "SecLists · raft small directories": "/usr/share/seclists/Discovery/Web-Content/raft-small-directories.txt",
+    "SecLists · raft medium directories": "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt",
+}
+
 
 def _format_created(value: str) -> str:
     try:
@@ -117,7 +128,7 @@ def _make_assessment(targets: dict[str, str], scanners: list[str], scan_type: st
     save_assessment(assessment)
     worker = threading.Thread(
         target=_run_assessment_worker,
-        args=(assessment["id"], targets, scanners, scan_type, ports, wordlist, burp_api_url, burp_api_key, burp_profile),
+        args=(assessment["id"], targets, scanners, scan_type, ports, wordlist, burp_api_url, burp_api_key, burp_profile, scan_config or {}),
         name=f"scan-{assessment['id'][:8]}", daemon=True,
     )
     worker.start()
@@ -149,7 +160,8 @@ def _start_rescan(source: dict[str, Any]) -> str:
 
 
 def _run_assessment_worker(assessment_id: str, targets: dict[str, str], scanners: list[str], scan_type: str,
-                           ports: str, wordlist: str, burp_api_url: str, burp_api_key: str, burp_profile: str) -> None:
+                           ports: str, wordlist: str, burp_api_url: str, burp_api_key: str, burp_profile: str,
+                           scan_config: dict[str, Any]) -> None:
     """Run scanner work off the Streamlit request and persist each state change."""
     for scanner in scanners:
         assessment = get_assessment(assessment_id)
@@ -176,6 +188,7 @@ def _run_assessment_worker(assessment_id: str, targets: dict[str, str], scanners
             findings, raw_path = run_scan(
                 scanner, target, scan_type=scan_type, ports=ports, wordlist=wordlist,
                 burp_api_url=burp_api_url, burp_api_key=burp_api_key, burp_profile=burp_profile,
+                nmap_options=scan_config.get("nmap_options", {}),
                 on_progress=report_progress if scanner == "burp" else None,
             )
             assessment = get_assessment(assessment_id)
@@ -535,9 +548,49 @@ def _new_assessment_page() -> None:
                     ).strip()
                 else:
                     st.caption("No guessed scan configuration is sent; Burp uses its own default configuration.")
-        scan_type = st.selectbox("Nmap profile", ["quick", "version"], help="Quick scans common ports; version attempts service detection on the top 100 ports.")
-        ports = st.text_input("Optional Nmap ports", placeholder="e.g. 80,443 or 1-1000")
-        wordlist = st.text_input("Wordlist path (Gobuster / ffuf)", placeholder="/path/to/wordlist.txt")
+        nmap_flags: list[str] = []
+        nmap_timing = "T3"
+        if "nmap" in scanners:
+            nmap_profile_label = st.selectbox(
+                "Nmap port profile", ["Quick · top 100 common TCP ports", "Service/version · top 100 ports"],
+                help="Quick uses Nmap fast mode. Service/version probes open ports for service details.",
+            )
+            scan_type = "quick" if nmap_profile_label.startswith("Quick") else "version"
+            ports = st.text_input("Optional Nmap ports", placeholder="e.g. 80,443 or 1-1000")
+            nmap_timing = st.select_slider("Nmap timing", options=[f"T{i}" for i in range(6)], value="T3",
+                                           help="T0 is very slow and cautious; higher values are faster and more noticeable.")
+            flag_labels = {
+                "TCP connect (-sT)": "tcp_connect",
+                "SYN scan (-sS; requires raw-socket privileges)": "syn_scan",
+                "UDP scan (-sU; slower)": "udp_scan",
+                "Detect OS (-O; requires raw-socket privileges)": "os_detection",
+                "Default NSE scripts (-sC)": "default_scripts",
+                "Skip host discovery (-Pn)": "skip_host_discovery",
+                "Show open ports only (--open)": "open_only",
+            }
+            selected_nmap_flags = st.multiselect("Additional Nmap options", list(flag_labels),
+                                                 help="Select only the options appropriate for your authorized target.")
+            nmap_flags = [flag_labels[label] for label in selected_nmap_flags]
+            if "tcp_connect" in nmap_flags and "syn_scan" in nmap_flags:
+                st.error("Choose either TCP connect or SYN scan, not both.")
+        else:
+            scan_type, ports = "quick", ""
+
+        wordlist = ""
+        if any(name in scanners for name in ("gobuster", "ffuf")):
+            wordlist_labels = ["Select a wordlist"] + list(KALI_WEB_WORDLISTS) + ["Custom path"]
+            installed_labels = [label for label, path in KALI_WEB_WORDLISTS.items() if Path(path).is_file()]
+            wordlist_index = wordlist_labels.index(installed_labels[0]) if installed_labels else 0
+            wordlist_choice = st.selectbox("Kali web wordlist", wordlist_labels, index=wordlist_index,
+                                           help="Common Kali DirB, DirBuster, and SecLists paths are detected on this machine.")
+            if wordlist_choice == "Custom path":
+                wordlist = st.text_input("Custom wordlist file", placeholder="/path/to/wordlist.txt").strip()
+            elif wordlist_choice in KALI_WEB_WORDLISTS:
+                wordlist = KALI_WEB_WORDLISTS[wordlist_choice]
+                if Path(wordlist).is_file():
+                    st.caption(f"Found: {wordlist}")
+                else:
+                    st.warning(f"Not installed at {wordlist}. Install the corresponding Kali wordlists package or choose another path.")
         if any(name in scanners for name in ("zap", "sqlmap")):
             st.warning("ZAP Quick Start and sqlmap send active test requests to the target. Use only on applications you are authorized to test.")
         approved = st.checkbox("I own these targets or have explicit permission to scan them.")
@@ -568,8 +621,11 @@ def _new_assessment_page() -> None:
         if "burp" in scanners and not burp_api_key.strip():
             st.error("Configure Burp's REST API URL and key on the Settings page before starting a Burp scan.")
             return
-        if any(name in scanners for name in ("gobuster", "ffuf")) and not wordlist.strip():
-            st.error("Enter an existing local wordlist path for Gobuster or ffuf.")
+        if "nmap" in scanners and "tcp_connect" in nmap_flags and "syn_scan" in nmap_flags:
+            st.error("Choose either TCP connect or SYN scan, not both.")
+            return
+        if any(name in scanners for name in ("gobuster", "ffuf")) and not Path(wordlist).expanduser().is_file():
+            st.error("Choose an existing local wordlist file for Gobuster or ffuf.")
             return
         missing = [name for name in scanners if name != "burp" and not availability[name][0]]
         if missing:
@@ -577,7 +633,9 @@ def _new_assessment_page() -> None:
         assessment_id = _make_assessment(
             targets, scanners, scan_type, ports.strip(), wordlist.strip(),
             burp_api_url.strip(), burp_api_key.strip(), burp_profile,
-            scan_config={"scan_type": scan_type, "ports": ports.strip(), "wordlist": wordlist.strip(), "burp_profile": burp_profile},
+            scan_config={"scan_type": scan_type, "ports": ports.strip(), "wordlist": wordlist.strip(),
+                         "burp_profile": burp_profile,
+                         "nmap_options": {"timing": nmap_timing, "flags": nmap_flags}},
         )
         st.session_state["current_assessment_id"] = assessment_id
         st.rerun()

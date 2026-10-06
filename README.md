@@ -39,8 +39,11 @@ go install github.com/OJ/gobuster/v3@latest
 export PATH="$PATH:$(go env GOPATH)/bin"
 ```
 
-The assessment form needs a local wordlist path, for example
-`/usr/share/wordlists/dirb/common.txt` when that file is installed.
+The assessment form detects common Kali wordlists for Gobuster and ffuf, including
+DirB, DirBuster, and SecLists lists. Install the relevant package if a suggested
+file is missing, or choose a custom wordlist path. Nmap also exposes timing,
+TCP/UDP, service/version, OS-detection, script, host-discovery, and output
+options; some options require raw-socket privileges and UDP scans take longer.
 
 ## Windows development setup
 
@@ -145,6 +148,13 @@ them only with explicit authorization. Named scan configurations can vary by
 Burp installation, so the integration does not assume a built-in name. If
 Burp's API is not available in your edition/setup, the existing XML import
 workflow remains.
+
+Burp itself performs requests to the seed URL. If it pauses with “Could not
+connect to any seed URLs,” check DNS, outbound access, TLS trust, and redirects
+from the machine running Burp (not just the dashboard host). If the site sends
+Burp to another host, enter the final destination and include that host in the
+authorized scan scope. The ZAP CLI adapter chooses an available local proxy port
+for each scan to avoid collisions with Burp or another proxy.
 
 ## Burp / OpenVAS report workflow
 
