@@ -79,9 +79,14 @@ Supported optional settings:
 | `NIKTO_SCRIPT` | Path to `nikto.pl` if Nikto is used from a source checkout |
 
 The dashboard shows queued, running, and completed scanners for every active
-assessment and refreshes live progress automatically. Scans run in background
-workers, so you can start another assessment or inspect saved results while a
-long-running tool is still working. Assessment history and scanner evidence are stored under `data/` by default.
+assessment and refreshes live progress automatically. A detached local queue
+worker runs assessments one at a time, which avoids overlapping scanner and
+proxy processes. It continues if the dashboard is closed or restarted. If the
+computer itself shuts down, the next dashboard launch resumes unfinished
+scanner steps; completed steps and their findings are kept. Worker diagnostics
+are written to `data/logs/scan-worker.log`. The scan form blocks unavailable
+selected tools and rejects malformed web targets before creating a scan.
+Assessment history and scanner evidence are stored under `data/` by default.
 Set `SOC_AGENT_DATA_DIR` to move those files outside the source checkout.
 For an OS move, stop the dashboard first, then copy the entire `data/` folder
 to the Linux project. Database scanner-output references are normalized to

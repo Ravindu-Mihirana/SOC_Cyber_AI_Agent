@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 import sqlite3
 from contextlib import closing
 from datetime import datetime, timezone
@@ -37,6 +38,13 @@ def _connect() -> sqlite3.Connection:
             group_id TEXT NOT NULL DEFAULT '',
             scan_number INTEGER NOT NULL DEFAULT 1,
             scan_config TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS scan_worker_runtime (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            pid INTEGER NOT NULL,
+            heartbeat REAL NOT NULL
         )
     """)
     existing = {row["name"] for row in connection.execute("PRAGMA table_info(assessments)")}
@@ -148,23 +156,79 @@ def list_assessments(limit: int = 100) -> list[dict[str, Any]]:
 
 
 def recover_interrupted_assessments() -> int:
-    """Mark scans left active by a prior process as interrupted after startup."""
+    """Requeue scans previously marked interrupted by older app versions."""
     with closing(_connect()) as connection:
         connection.execute("BEGIN IMMEDIATE")
-        rows = connection.execute("SELECT id, scanner_results FROM assessments WHERE status = 'running'").fetchall()
+        rows = connection.execute("SELECT id, status, scanner_results FROM assessments").fetchall()
+        recovered = 0
         for row in rows:
             results = json.loads(row["scanner_results"])
-            for name, result in results.items():
-                if result.get("status") in {"queued", "running"}:
-                    result["status"] = "failed"
-                    result["error"] = "Scan was interrupted when the application stopped. Start a new scan to retry."
-            completed = any(result.get("status") == "complete" for result in results.values())
-            connection.execute(
-                "UPDATE assessments SET status = ?, scanner_results = ? WHERE id = ?",
-                ("complete" if completed and not any(item.get("status") == "failed" for item in results.values()) else "partial" if completed else "failed", json.dumps(results), row["id"]),
-            )
+            changed = False
+            for result in results.values():
+                if str(result.get("error", "")).startswith("Scan was interrupted when the application stopped."):
+                    result["status"] = "queued"
+                    result.pop("error", None)
+                    result.pop("progress", None)
+                    result["detail"] = "Resuming after dashboard restart"
+                    changed = True
+            pending = any(result.get("status") in {"queued", "running"} for result in results.values())
+            if changed and pending:
+                connection.execute(
+                    "UPDATE assessments SET status = 'running', scanner_results = ? WHERE id = ?",
+                    (json.dumps(results), row["id"]),
+                )
+                recovered += 1
         connection.commit()
-    return len(rows)
+    return recovered
+
+
+def list_pending_assessments() -> list[dict[str, Any]]:
+    with closing(_connect()) as connection:
+        rows = connection.execute("SELECT * FROM assessments WHERE status = 'running' ORDER BY created_at ASC").fetchall()
+    return [_decode(row) for row in rows]
+
+
+def scan_worker_state() -> dict[str, Any] | None:
+    with closing(_connect()) as connection:
+        row = connection.execute("SELECT pid, heartbeat FROM scan_worker_runtime WHERE singleton = 1").fetchone()
+    return dict(row) if row else None
+
+
+def claim_scan_worker(pid: int, *, stale_after: float = 20.0) -> bool:
+    now = time.time()
+    with closing(_connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT pid, heartbeat FROM scan_worker_runtime WHERE singleton = 1").fetchone()
+        if row:
+            try:
+                os.kill(int(row["pid"]), 0)
+            except (OSError, ProcessLookupError):
+                pass
+            else:
+                # A slow or temporarily DB-blocked live worker must not be
+                # displaced: it may currently own a scanner or proxy process.
+                connection.rollback()
+                return int(row["pid"]) == pid
+        connection.execute(
+            "INSERT INTO scan_worker_runtime(singleton, pid, heartbeat) VALUES (1, ?, ?) "
+            "ON CONFLICT(singleton) DO UPDATE SET pid=excluded.pid, heartbeat=excluded.heartbeat",
+            (pid, now),
+        )
+        connection.commit()
+    return True
+
+
+def update_scan_worker_heartbeat(pid: int) -> bool:
+    with closing(_connect()) as connection:
+        cursor = connection.execute("UPDATE scan_worker_runtime SET heartbeat = ? WHERE singleton = 1 AND pid = ?", (time.time(), pid))
+        connection.commit()
+    return cursor.rowcount == 1
+
+
+def release_scan_worker(pid: int) -> None:
+    with closing(_connect()) as connection:
+        connection.execute("DELETE FROM scan_worker_runtime WHERE singleton = 1 AND pid = ?", (pid,))
+        connection.commit()
 
 
 def list_assessment_scans(group_id: str) -> list[dict[str, Any]]:

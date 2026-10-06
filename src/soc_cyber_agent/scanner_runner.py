@@ -66,6 +66,20 @@ def _check_url(target: str) -> None:
         raise ScannerError("Web scanner target must be an http(s) URL without embedded credentials.")
 
 
+def validate_web_target(target: str) -> str:
+    """Validate and return a normalized URL accepted by the web adapters."""
+    value = target.strip()
+    try:
+        _check_url(value)
+        parsed = urlparse(value)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ScannerError(f"Invalid web scanner target URL: {exc}") from exc
+    if any(character.isspace() for character in value) or any(ord(character) < 32 for character in value):
+        raise ScannerError("Web scanner target cannot contain spaces or control characters.")
+    return value
+
+
 def normalize_burp_seed(target: str) -> str:
     """Validate a single absolute Burp seed and canonicalize its origin/path."""
     value = target.strip()

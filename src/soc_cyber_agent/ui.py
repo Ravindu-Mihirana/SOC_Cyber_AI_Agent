@@ -1,6 +1,5 @@
 """Streamlit dashboard for scans, AI review, history, and report downloads."""
 
-import threading
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -13,7 +12,8 @@ from soc_cyber_agent.ai_analyzer import AIAnalysisError, analyze_assessment, lis
 from soc_cyber_agent.reports import render_html, render_pdf
 from soc_cyber_agent.report_importers import ReportImportError, parse_burp_xml, parse_openvas_xml
 from soc_cyber_agent.report_agent import agent_status, start_report_agent, stop_report_agent
-from soc_cyber_agent.scanner_runner import SCANNERS, ScannerError, normalize_burp_seed, run_scan, scanner_availability
+from soc_cyber_agent.scan_worker import ensure_scan_worker_started
+from soc_cyber_agent.scanner_runner import SCANNERS, ScannerError, normalize_burp_seed, scanner_availability, validate_web_target
 from soc_cyber_agent.tool_catalog import TOOL_CATEGORIES, catalog_tool_status
 from soc_cyber_agent.storage import (
     data_dir, delete_assessment, get_assessment, list_assessment_scans,
@@ -21,6 +21,7 @@ from soc_cyber_agent.storage import (
 )
 
 recover_interrupted_assessments()
+ensure_scan_worker_started()
 
 KALI_WEB_WORDLISTS = {
     "DirB · common": "/usr/share/wordlists/dirb/common.txt",
@@ -126,12 +127,8 @@ def _make_assessment(targets: dict[str, str], scanners: list[str], scan_type: st
         for scanner in scanners
     }
     save_assessment(assessment)
-    worker = threading.Thread(
-        target=_run_assessment_worker,
-        args=(assessment["id"], targets, scanners, scan_type, ports, wordlist, burp_api_url, burp_api_key, burp_profile, scan_config or {}),
-        name=f"scan-{assessment['id'][:8]}", daemon=True,
-    )
-    worker.start()
+    if not ensure_scan_worker_started():
+        raise RuntimeError("Could not start the persistent scan queue. Check data/logs/scan-worker.log, then retry.")
     return assessment["id"]
 
 
@@ -157,61 +154,6 @@ def _start_rescan(source: dict[str, Any]) -> str:
         scan_number=next_scan_number(str(source.get("group_id", source["id"]))),
         scan_config=config,
     )
-
-
-def _run_assessment_worker(assessment_id: str, targets: dict[str, str], scanners: list[str], scan_type: str,
-                           ports: str, wordlist: str, burp_api_url: str, burp_api_key: str, burp_profile: str,
-                           scan_config: dict[str, Any]) -> None:
-    """Run scanner work off the Streamlit request and persist each state change."""
-    for scanner in scanners:
-        assessment = get_assessment(assessment_id)
-        if not assessment:
-            return
-        target = targets["nmap"] if scanner == "nmap" else targets["web"]
-        assessment["scanner_results"][scanner] = {"status": "running", "target": target, "detail": f"Starting {scanner.title()}"}
-        save_assessment(assessment)
-
-        def report_progress(message: str, scanner_name: str = scanner) -> None:
-            latest = get_assessment(assessment_id)
-            if not latest:
-                return
-            result = latest["scanner_results"].get(scanner_name, {})
-            result["detail"] = message
-            import re
-            match = re.search(r"(\d{1,3})%", message)
-            if match:
-                result["progress"] = min(100, int(match.group(1)))
-            latest["scanner_results"][scanner_name] = result
-            save_assessment(latest)
-
-        try:
-            findings, raw_path = run_scan(
-                scanner, target, scan_type=scan_type, ports=ports, wordlist=wordlist,
-                burp_api_url=burp_api_url, burp_api_key=burp_api_key, burp_profile=burp_profile,
-                nmap_options=scan_config.get("nmap_options", {}),
-                on_progress=report_progress if scanner == "burp" else None,
-            )
-            assessment = get_assessment(assessment_id)
-            if not assessment:
-                return
-            assessment["findings"].extend(findings)
-            assessment["scanner_results"][scanner] = {
-                "status": "complete", "target": target, "count": len(findings), "raw_path": raw_path, "progress": 100,
-            }
-        except Exception as exc:
-            assessment = get_assessment(assessment_id)
-            if not assessment:
-                return
-            assessment["scanner_results"][scanner] = {"status": "failed", "target": target, "error": str(exc), "progress": 100}
-        assessment["status"] = "running"
-        save_assessment(assessment)
-    assessment = get_assessment(assessment_id)
-    if assessment:
-        statuses = [item.get("status") for item in assessment["scanner_results"].values()]
-        completed = sum(status == "complete" for status in statuses)
-        failed = sum(status == "failed" for status in statuses)
-        assessment["status"] = "complete" if completed and not failed else "partial" if completed else "failed"
-        save_assessment(assessment)
 
 
 def _findings_table(findings: list[dict[str, Any]]) -> None:
@@ -614,7 +556,7 @@ def _new_assessment_page() -> None:
                 st.error("Enter an http(s) URL for the web scanners.")
                 return
             try:
-                targets["web"] = normalize_burp_seed(web_target) if "burp" in scanners else web_target.strip()
+                targets["web"] = normalize_burp_seed(web_target) if "burp" in scanners else validate_web_target(web_target)
             except ScannerError as exc:
                 st.error(str(exc))
                 return
@@ -629,14 +571,19 @@ def _new_assessment_page() -> None:
             return
         missing = [name for name in scanners if name != "burp" and not availability[name][0]]
         if missing:
-            st.warning(f"Unavailable scanners will be recorded as failed: {', '.join(missing)}")
-        assessment_id = _make_assessment(
-            targets, scanners, scan_type, ports.strip(), wordlist.strip(),
-            burp_api_url.strip(), burp_api_key.strip(), burp_profile,
-            scan_config={"scan_type": scan_type, "ports": ports.strip(), "wordlist": wordlist.strip(),
-                         "burp_profile": burp_profile,
-                         "nmap_options": {"timing": nmap_timing, "flags": nmap_flags}},
-        )
+            st.error(f"Install or configure these selected scanners before starting: {', '.join(missing)}")
+            return
+        try:
+            assessment_id = _make_assessment(
+                targets, scanners, scan_type, ports.strip(), wordlist.strip(),
+                burp_api_url.strip(), burp_api_key.strip(), burp_profile,
+                scan_config={"scan_type": scan_type, "ports": ports.strip(), "wordlist": wordlist.strip(),
+                             "burp_profile": burp_profile,
+                             "nmap_options": {"timing": nmap_timing, "flags": nmap_flags}},
+            )
+        except (RuntimeError, OSError) as exc:
+            st.error(f"Scan was saved but could not be queued yet: {exc}")
+            return
         st.session_state["current_assessment_id"] = assessment_id
         st.rerun()
     current_id = st.session_state.get("current_assessment_id")
