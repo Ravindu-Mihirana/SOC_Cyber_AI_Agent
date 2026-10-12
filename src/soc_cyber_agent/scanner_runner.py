@@ -257,7 +257,7 @@ def _burp_issue_findings(issues_response: object, *, target: str, job_id: str) -
 
 
 def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api_key: str,
-                   profile: str = "", on_progress: Callable[[str], None] | None = None,
+                   profile: str = "Crawl and Audit - Balanced", on_progress: Callable[[str], None] | None = None,
                    control_check: Callable[[], str] | None = None,
                    timeout: int = 7200) -> tuple[list[Finding], Path, str]:
     """Start and monitor a Burp scan, then persist the API's raw issue response."""
@@ -268,8 +268,7 @@ def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api
     if not api_key.strip():
         raise ScannerError("Enter the API key configured in Burp Suite REST API settings.")
     scan_request: dict[str, object] = {"urls": [target]}
-    # Named scan configurations are installation-specific. Omit this field by
-    # default so Burp uses its own configured default instead of a guessed name.
+    # Use Burp's built-in balanced crawl-and-audit preset by default.
     if profile.strip():
         scan_request["scan_configurations"] = [{"name": profile.strip(), "type": "NamedConfiguration"}]
     start_response = _burp_request(
@@ -438,7 +437,7 @@ def run_scan(
     wordlist: str = "",
     burp_api_url: str = "http://127.0.0.1:1337",
     burp_api_key: str = "",
-    burp_profile: str = "",
+    burp_profile: str = "Crawl and Audit - Balanced",
     nmap_options: dict[str, object] | None = None,
     on_progress: Callable[[str], None] | None = None,
     control_check: Callable[[], str] | None = None,

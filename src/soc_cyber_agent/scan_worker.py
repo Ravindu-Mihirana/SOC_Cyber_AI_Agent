@@ -179,7 +179,7 @@ def _run_assessment(assessment_id: str) -> None:
                 wordlist=str(config.get("wordlist", "")),
                 burp_api_url=settings["burp_api_url"],
                 burp_api_key=settings["burp_api_key"],
-                burp_profile=str(config.get("burp_profile", "")),
+                burp_profile=str(config.get("burp_profile") or "Crawl and Audit - Balanced"),
                 nmap_options=config.get("nmap_options", {}),
                 resource_profile=resource_profile,
                 on_progress=report_progress,

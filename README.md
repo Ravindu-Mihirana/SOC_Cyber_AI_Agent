@@ -154,7 +154,9 @@ dashboard run on the same Kali VM. In the dashboard's **Settings** page, save
 the service root (normally `http://127.0.0.1:1337`) and API key once. The key is
 kept in the ignored local `data/app-settings.json` file with restrictive POSIX
 permissions. New assessments reuse the saved connection. Select **Burp**, enter
-an absolute target URL such as `https://authorized.example/`. The app asks Burp to use its configured default scan behavior,
+an absolute target URL such as `https://authorized.example/`. The app defaults to Burp's built-in
+`Crawl and Audit - Balanced` configuration for general-purpose coverage and speed. The scan form
+also lets you use Burp's configured default or enter an exact named configuration,
 waits for completion, stores the raw API result under `data/raw/`, and normalizes
 issues into the assessment. The REST API reference is available from Burp at
 `[service URL]/[API key]`; API routes can vary by Burp version.

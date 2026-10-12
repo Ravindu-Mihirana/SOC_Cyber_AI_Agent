@@ -181,7 +181,7 @@ def _start_rescan(source: dict[str, Any]) -> str:
     return _make_assessment(
         targets, scanners, str(config.get("scan_type", "quick")), str(config.get("ports", "")),
         str(config.get("wordlist", "")), settings["burp_api_url"], settings["burp_api_key"],
-        "" if config.get("burp_profile") == "Crawl and Audit - Lightweight" else str(config.get("burp_profile", "")),
+        str(config.get("burp_profile") or "Crawl and Audit - Balanced"),
         group_id=str(source.get("group_id", source["id"])),
         scan_number=next_scan_number(str(source.get("group_id", source["id"]))),
         scan_config=config,
@@ -545,9 +545,9 @@ def _new_assessment_page() -> None:
                     st.warning("Burp connection is not configured. Add its service URL and API key on the Settings page.")
                 burp_mode = st.selectbox(
                     "Burp scan configuration",
-                    options=["Use Burp default", "Choose a named configuration"],
-                    help="Use Burp's configured default, or enter the exact configuration name available in this Burp installation.",
-                    key="burp_scan_mode",
+                    options=["Crawl and Audit - Balanced (recommended)", "Use Burp default", "Choose a named configuration"],
+                    help="Balanced is Burp's general-purpose built-in crawl and audit configuration, balancing coverage and speed.",
+                    key="burp_scan_mode_balanced_default",
                 )
                 if burp_mode == "Choose a named configuration":
                     burp_profile = st.text_input(
@@ -556,6 +556,9 @@ def _new_assessment_page() -> None:
                         help="Names vary by Burp edition and installation. Leave this mode unselected to use Burp's default.",
                         key="burp_custom_profile",
                     ).strip()
+                elif burp_mode == "Crawl and Audit - Balanced (recommended)":
+                    burp_profile = "Crawl and Audit - Balanced"
+                    st.caption("Burp will crawl the target and run a balanced audit, using its built-in general-purpose preset.")
                 else:
                     st.caption("No guessed scan configuration is sent; Burp uses its own default configuration.")
         nmap_flags: list[str] = []
