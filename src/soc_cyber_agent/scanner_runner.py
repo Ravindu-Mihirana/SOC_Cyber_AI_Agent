@@ -136,7 +136,10 @@ def _terminate_process(process: subprocess.Popen[bytes]) -> None:
 
 
 def _run(args: list[str], *, timeout: int, allow_nonzero: bool = False,
-         control_check: Callable[[], str] | None = None) -> subprocess.CompletedProcess[str]:
+         control_check: Callable[[], str] | None = None,
+         env: dict[str, str] | None = None,
+         on_progress: Callable[[str], None] | None = None,
+         progress_label: str = "Scanner") -> subprocess.CompletedProcess[str]:
     output_file = tempfile.TemporaryFile(mode="w+b")
     try:
         process_options: dict[str, object] = {"stdout": output_file, "stderr": subprocess.STDOUT}
@@ -144,11 +147,13 @@ def _run(args: list[str], *, timeout: int, allow_nonzero: bool = False,
             process_options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
         else:
             process_options["start_new_session"] = True
-        process = subprocess.Popen(args, **process_options)
+        process = subprocess.Popen(args, env=env, **process_options)
     except FileNotFoundError as exc:
         output_file.close()
         raise ScannerError(f"Scanner executable not found: {args[0]}") from exc
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
+    next_progress = started + 15
     while process.poll() is None:
         if control_check:
             control = control_check()
@@ -162,6 +167,10 @@ def _run(args: list[str], *, timeout: int, allow_nonzero: bool = False,
             detail = output_file.read().decode("utf-8", "replace")
             output_file.close()
             raise ScannerError(f"Scan timed out after {timeout} seconds. {detail[-2500:]}".strip())
+        now = time.monotonic()
+        if on_progress and now >= next_progress:
+            on_progress(f"{progress_label.title()} process is running · {int(now - started)} seconds elapsed")
+            next_progress = now + 15
         time.sleep(0.25)
     output_file.seek(0)
     output = output_file.read().decode("utf-8", "replace")
@@ -427,10 +436,14 @@ def run_scan(
     nmap_options: dict[str, object] | None = None,
     on_progress: Callable[[str], None] | None = None,
     control_check: Callable[[], str] | None = None,
+    resource_profile: str = "vm_safe",
 ) -> tuple[list[dict[str, object]], str]:
     """Execute one scan and return normalized findings plus the raw-output path."""
     if scanner not in SCANNERS:
         raise ScannerError(f"Unknown scanner: {scanner}")
+    if resource_profile not in {"vm_safe", "balanced"}:
+        raise ScannerError("Choose the VM-safe or balanced resource profile.")
+    vm_safe = resource_profile == "vm_safe"
     job_id = str(uuid.uuid4())
     raw_dir = data_dir() / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -480,7 +493,7 @@ def run_scan(
         if ports:
             args += ["-p", ports]
         args.append(target)
-        _run(args, timeout=900, control_check=control_check)
+        _run(args, timeout=900, control_check=control_check, on_progress=on_progress, progress_label=scanner)
         findings = parse_nmap_xml(raw_path, target=target, job_id=job_id)
     elif scanner == "nikto":
         _check_url(target)
@@ -489,7 +502,7 @@ def run_scan(
             raise ScannerError("Nikto was not found. Install Nikto and Perl, or set NIKTO_SCRIPT to nikto.pl.")
         raw_path = raw_dir / f"{job_id}-nikto.json"
         args = command + ["-h", target, "-output", str(raw_path), "-Format", "json", "-maxtime", "5m", "-timeout", "10", "-nointeractive", "-nocheck"]
-        completed = _run(args, timeout=360, allow_nonzero=True, control_check=control_check)
+        completed = _run(args, timeout=360, allow_nonzero=True, control_check=control_check, on_progress=on_progress, progress_label=scanner)
         console_output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
         log_path = raw_dir / f"{job_id}-nikto.log"
         if console_output:
@@ -528,8 +541,8 @@ def run_scan(
         if not wordlist_path.is_file():
             raise ScannerError("Choose an existing local wordlist file for Gobuster.")
         raw_path = raw_dir / f"{job_id}-gobuster.txt"
-        args = [executable, "dir", "-u", target, "-w", str(wordlist_path.resolve()), "-t", "10", "-q", "-o", str(raw_path)]
-        _run(args, timeout=1800, control_check=control_check)
+        args = [executable, "dir", "-u", target, "-w", str(wordlist_path.resolve()), "-t", "2" if vm_safe else "10", "-q", "-o", str(raw_path)]
+        _run(args, timeout=1800, control_check=control_check, on_progress=on_progress, progress_label=scanner)
         findings = parse_gobuster_text(raw_path, target=target, job_id=job_id)
     elif scanner == "nuclei":
         _check_url(target)
@@ -537,8 +550,10 @@ def run_scan(
         if not executable:
             raise ScannerError("Nuclei executable was not found on PATH.")
         raw_path = raw_dir / f"{job_id}-nuclei.jsonl"
-        args = [executable, "-u", target, "-jsonl", "-o", str(raw_path), "-rl", "10", "-timeout", "5", "-retries", "1", "-no-color"]
-        _run(args, timeout=1800, control_check=control_check)
+        args = [executable, "-u", target, "-jsonl", "-o", str(raw_path),
+                "-rl", "3" if vm_safe else "10", "-c", "3" if vm_safe else "10",
+                "-bs", "2" if vm_safe else "5", "-timeout", "5", "-retries", "1", "-no-color"]
+        _run(args, timeout=1800, control_check=control_check, on_progress=on_progress, progress_label=scanner)
         findings = _parse_nuclei(raw_path, target, job_id)
     elif scanner == "ffuf":
         _check_url(target)
@@ -550,8 +565,10 @@ def run_scan(
             raise ScannerError("Choose an existing local wordlist file for ffuf.")
         raw_path = raw_dir / f"{job_id}-ffuf.json"
         fuzz_url = target.rstrip("/") + "/FUZZ"
-        args = [executable, "-u", fuzz_url, "-w", str(wordlist_path.resolve()), "-of", "json", "-o", str(raw_path), "-rate", "10", "-t", "10", "-maxtime", "1800", "-noninteractive"]
-        _run(args, timeout=1900, control_check=control_check)
+        args = [executable, "-u", fuzz_url, "-w", str(wordlist_path.resolve()), "-of", "json", "-o", str(raw_path),
+                "-rate", "2" if vm_safe else "10", "-t", "2" if vm_safe else "10",
+                "-maxtime", "1800", "-noninteractive"]
+        _run(args, timeout=1900, control_check=control_check, on_progress=on_progress, progress_label=scanner)
         findings = _parse_ffuf(raw_path, target, job_id)
     elif scanner == "zap":
         _check_url(target)
@@ -560,7 +577,19 @@ def run_scan(
             raise ScannerError("OWASP ZAP executable was not found on PATH.")
         raw_path = raw_dir / f"{job_id}-zap.json"
         proxy_port = _free_local_port()
-        completed = _run([executable, "-cmd", "-silent", "-port", str(proxy_port), "-quickurl", target, "-quickout", str(raw_path)], timeout=3600, allow_nonzero=True, control_check=control_check)
+        zap_env = os.environ.copy()
+        if vm_safe:
+            # JAVA_TOOL_OPTIONS applies a bounded heap to ZAP's JVM launched by
+            # the Kali wrapper. Replace any existing Xmx so the cap is clear.
+            java_options = re.sub(r"(?<!\S)-Xmx\S+", "", zap_env.get("JAVA_TOOL_OPTIONS", "")).strip()
+            zap_env["JAVA_TOOL_OPTIONS"] = f"{java_options} -Xmx768m".strip()
+        zap_args = [executable, "-cmd", "-silent", "-port", str(proxy_port)]
+        if vm_safe:
+            zap_args.append("-lowmem")
+        zap_args += ["-quickurl", target, "-quickout", str(raw_path)]
+        completed = _run(zap_args, timeout=3600, allow_nonzero=True,
+                         control_check=control_check, env=zap_env,
+                         on_progress=on_progress, progress_label=scanner)
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "No output from ZAP.").strip()
             raise ScannerError(f"ZAP exited with code {completed.returncode} using proxy port {proxy_port}: {detail[-2500:]}")
@@ -576,7 +605,7 @@ def run_scan(
         if not executable:
             raise ScannerError("sqlmap executable was not found on PATH.")
         output_dir = raw_dir / f"{job_id}-sqlmap"
-        completed = _run([executable, "-u", target, "--batch", "--smart", "--risk=1", "--level=1", "--crawl=1", "--output-dir", str(output_dir)], timeout=3600, allow_nonzero=True, control_check=control_check)
+        completed = _run([executable, "-u", target, "--batch", "--smart", "--risk=1", "--level=1", "--crawl=1", "--output-dir", str(output_dir)], timeout=3600, allow_nonzero=True, control_check=control_check, on_progress=on_progress, progress_label=scanner)
         raw_path = raw_dir / f"{job_id}-sqlmap.txt"
         output = (completed.stdout or "") + "\n" + (completed.stderr or "")
         raw_path.write_text(output, encoding="utf-8", errors="replace")

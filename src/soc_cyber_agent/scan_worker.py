@@ -90,6 +90,41 @@ def _persist_scanner_state(assessment_id: str, scanner: str, update: dict[str, A
     return assessment
 
 
+def _available_memory_mb() -> int | None:
+    """Read Linux's reclaimable RAM estimate; return None on other platforms."""
+    try:
+        for line in Path("/proc/meminfo").read_text(encoding="ascii").splitlines():
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _wait_for_memory(assessment_id: str, scanner: str, profile: str) -> None:
+    if profile != "vm_safe":
+        return
+    threshold_mb = 1400 if scanner == "zap" else 700
+    deadline = time.monotonic() + 120
+    while True:
+        control = get_assessment_control(assessment_id)
+        if control in {"paused", "stopping"}:
+            raise ScanControlRequested(control)
+        available = _available_memory_mb()
+        if available is None or available >= threshold_mb:
+            return
+        _persist_scanner_state(assessment_id, scanner, {
+            "status": "queued",
+            "detail": f"Waiting for VM memory: {available} MiB available; {threshold_mb} MiB required before starting.",
+        })
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"VM-safe mode did not start {scanner.title()}: RAM stayed below {threshold_mb} MiB available for 2 minutes. "
+                "Close memory-heavy applications or increase VM memory, then retry."
+            )
+        time.sleep(3)
+
+
 def _run_assessment(assessment_id: str) -> None:
     assessment = get_assessment(assessment_id)
     if not assessment:
@@ -119,11 +154,7 @@ def _run_assessment(assessment_id: str) -> None:
         if result.get("status") not in {"queued", "running"}:
             continue
         target = str(result.get("target") or "")
-        _persist_scanner_state(assessment_id, scanner, {
-            "status": "running", "target": target,
-            "detail": f"Starting {scanner.title()} in the persistent scan queue",
-            "error": "", "progress": 0,
-        })
+        resource_profile = str(config.get("resource_profile", "vm_safe"))
 
         def report_progress(message: str, scanner_name: str = scanner) -> None:
             import re
@@ -134,6 +165,12 @@ def _run_assessment(assessment_id: str) -> None:
             _persist_scanner_state(assessment_id, scanner_name, update)
 
         try:
+            _wait_for_memory(assessment_id, scanner, resource_profile)
+            _persist_scanner_state(assessment_id, scanner, {
+                "status": "running", "target": target,
+                "detail": f"Starting {scanner.title()} in the persistent scan queue",
+                "error": "", "progress": 0,
+            })
             findings, raw_path = run_scan(
                 scanner,
                 target,
@@ -144,7 +181,8 @@ def _run_assessment(assessment_id: str) -> None:
                 burp_api_key=settings["burp_api_key"],
                 burp_profile=str(config.get("burp_profile", "")),
                 nmap_options=config.get("nmap_options", {}),
-                on_progress=report_progress if scanner == "burp" else None,
+                resource_profile=resource_profile,
+                on_progress=report_progress,
                 control_check=lambda: get_assessment_control(assessment_id),
             )
             latest = get_assessment(assessment_id)

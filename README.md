@@ -87,8 +87,17 @@ scanner steps; completed steps and their findings are kept. Worker diagnostics
 are written to `data/logs/scan-worker.log`. The scan form blocks unavailable
 selected tools and rejects malformed web targets before creating a scan.
 Each active assessment can be paused or stopped from the dashboard or history.
-These controls take effect after the current scanner finishes; a stopped scan
-can then be deleted from history. Resume continues with the remaining tools.
+Local scanner processes stop when requested; resuming a paused scan restarts
+the interrupted tool. Burp runs inside Burp Suite and may need to be cancelled
+there. A stopped scan can then be deleted from history.
+New assessments default to the VM-safe resource profile: it reduces Gobuster,
+Nuclei, and ffuf concurrency, caps ZAP's Java heap at 768 MiB, enables ZAP's
+low-memory mode, and on Linux waits for at least 700 MiB available RAM before
+ordinary tools or 1400 MiB before ZAP. If memory does not become available within two
+minutes, the scanner is marked failed with an explanatory message instead of being
+started. The Balanced profile uses higher scanner concurrency and does not
+apply the ZAP heap cap. Burp runs inside its own process and is not controlled
+by these limits.
 Assessment history and scanner evidence are stored under `data/` by default.
 Set `SOC_AGENT_DATA_DIR` to move those files outside the source checkout.
 For an OS move, stop the dashboard first, then copy the entire `data/` folder

@@ -396,7 +396,13 @@ def _dashboard_page() -> None:
                     cols[1].info("Running")
                 else:
                     cols[1].caption("Queued")
-                cols[2].caption(result.get("detail") or result.get("error") or result.get("target", ""))
+                error = str(result.get("error") or "").strip()
+                detail = str(result.get("detail") or "").strip()
+                # A stale startup detail should never hide the scanner's actual failure.
+                cols[2].caption(error if status == "failed" and error else detail or error or result.get("target", ""))
+                if status == "failed" and error:
+                    with st.expander(f"{scanner.title()} error details", expanded=False):
+                        st.code(error, language=None)
                 if status == "running" and result.get("progress") is not None:
                     cols[3].caption(f"{result['progress']}%")
                 elif status == "running":
@@ -490,6 +496,13 @@ def _new_assessment_page() -> None:
                         st.warning(f"{name.title()} · Setup needed")
                     st.caption(detail)
     with st.form("new_assessment_form"):
+        st.markdown("#### VM resource profile")
+        resource_profile_label = st.selectbox(
+            "Resource usage",
+            ["VM-safe (recommended)", "Balanced"],
+            help="VM-safe lowers scanner concurrency, caps ZAP's JVM heap, and checks available RAM on Linux before starting each tool. Burp's memory use is managed by Burp itself.",
+        )
+        resource_profile = "vm_safe" if resource_profile_label.startswith("VM-safe") else "balanced"
         st.markdown("#### 1 · Choose scanners")
         scanner_cols = st.columns(len(SCANNERS))
         selected = []
@@ -554,7 +567,7 @@ def _new_assessment_page() -> None:
             )
             scan_type = "quick" if nmap_profile_label.startswith("Quick") else "version"
             ports = st.text_input("Optional Nmap ports", placeholder="e.g. 80,443 or 1-1000")
-            nmap_timing = st.select_slider("Nmap timing", options=[f"T{i}" for i in range(6)], value="T3",
+            nmap_timing = st.select_slider("Nmap timing", options=[f"T{i}" for i in range(6)], value="T2" if resource_profile == "vm_safe" else "T3",
                                            help="T0 is very slow and cautious; higher values are faster and more noticeable.")
             flag_labels = {
                 "TCP connect (-sT)": "tcp_connect",
@@ -570,6 +583,8 @@ def _new_assessment_page() -> None:
             nmap_flags = [flag_labels[label] for label in selected_nmap_flags]
             if "tcp_connect" in nmap_flags and "syn_scan" in nmap_flags:
                 st.error("Choose either TCP connect or SYN scan, not both.")
+            if resource_profile == "vm_safe" and any(flag in nmap_flags for flag in ("udp_scan", "os_detection", "default_scripts")):
+                st.warning("UDP, OS detection, and NSE scripts can increase scan load even in VM-safe mode.")
         else:
             scan_type, ports = "quick", ""
 
@@ -634,6 +649,7 @@ def _new_assessment_page() -> None:
                 burp_api_url.strip(), burp_api_key.strip(), burp_profile,
                 scan_config={"scan_type": scan_type, "ports": ports.strip(), "wordlist": wordlist.strip(),
                              "burp_profile": burp_profile,
+                             "resource_profile": resource_profile,
                              "nmap_options": {"timing": nmap_timing, "flags": nmap_flags}},
             )
         except (RuntimeError, OSError) as exc:
