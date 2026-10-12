@@ -86,6 +86,9 @@ computer itself shuts down, the next dashboard launch resumes unfinished
 scanner steps; completed steps and their findings are kept. Worker diagnostics
 are written to `data/logs/scan-worker.log`. The scan form blocks unavailable
 selected tools and rejects malformed web targets before creating a scan.
+Each active assessment can be paused or stopped from the dashboard or history.
+These controls take effect after the current scanner finishes; a stopped scan
+can then be deleted from history. Resume continues with the remaining tools.
 Assessment history and scanner evidence are stored under `data/` by default.
 Set `SOC_AGENT_DATA_DIR` to move those files outside the source checkout.
 For an OS move, stop the dashboard first, then copy the entire `data/` folder

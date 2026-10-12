@@ -18,6 +18,7 @@ from soc_cyber_agent.tool_catalog import TOOL_CATEGORIES, catalog_tool_status
 from soc_cyber_agent.storage import (
     data_dir, delete_assessment, get_assessment, list_assessment_scans,
     list_assessments, new_assessment, next_scan_number, recover_interrupted_assessments, save_analysis, save_assessment,
+    set_assessment_control,
 )
 
 recover_interrupted_assessments()
@@ -51,12 +52,20 @@ def _open_assessment(assessment_id: str) -> None:
     st.session_state["workspace_page"] = "Assessment history"
 
 
+def _set_scan_control(assessment_id: str, control: str) -> None:
+    if set_assessment_control(assessment_id, control):
+        labels = {"paused": "Pause requested. It will pause after the current tool finishes.",
+                  "stopping": "Stop requested. The current tool will finish before the scan stops.",
+                  "": "Scan resumed."}
+        st.session_state["scan_control_message"] = labels[control]
+
+
 def _delete_assessment_and_evidence(assessment_id: str) -> tuple[bool, str]:
     assessment = get_assessment(assessment_id)
     if not assessment:
         return False, "Assessment was not found."
-    if assessment.get("status") == "running":
-        return False, "Wait for the active scan to finish before deleting its history."
+    if assessment.get("status") in {"running", "paused", "stopping"}:
+        return False, "Stop the scan and wait for it to finish before deleting its history."
     removed = delete_assessment(assessment_id)
     if not removed:
         return False, "Assessment was not found."
@@ -208,7 +217,7 @@ def _render_ai(assessment: dict[str, Any]) -> None:
     st.subheader("Unified AI assessment")
     settings = load_app_settings()
     st.caption(f"Cloud model: **{settings['ai_model']}** · {settings['ai_base_url']}")
-    st.caption("One analysis correlates every scanner’s findings and returns a prioritized remediation plan. Recommendations are advisory.")
+    st.caption("The analysis includes evidence confidence, correlated observations, prioritized fixes, validation steps, and coverage limits. Recommendations are advisory.")
     if not settings["ai_api_key"]:
         st.warning("Add the cloud provider API key in Settings before running an analysis.")
     st.warning("The configured online AI service receives normalized findings, scanner evidence, and coverage. Send them only when approved for this data.")
@@ -300,7 +309,7 @@ def _render_assessment(assessment: dict[str, Any]) -> None:
 @st.fragment(run_every=3)
 def _dashboard_page() -> None:
     assessments = list_assessments()
-    active = [item for item in assessments if item.get("status") == "running"]
+    active = [item for item in assessments if item.get("status") in {"running", "paused", "stopping"}]
     all_findings = sum(len(item.get("findings", [])) for item in assessments)
     st.markdown("<div class='eyebrow'>SECURITY OPERATIONS</div>", unsafe_allow_html=True)
     title, action = st.columns([4, 1])
@@ -310,23 +319,40 @@ def _dashboard_page() -> None:
         st.rerun(scope="app")
 
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Running scans", len(active))
+    m1.metric("Active scans", len(active))
     m2.metric("Saved assessments", len(assessments))
     m3.metric("Recorded findings", all_findings)
     m4.metric("Available tools", f"{sum(ready for ready, _ in scanner_availability().values())}/{len(SCANNERS)}")
 
     st.markdown("### Live scan progress")
+    control_message = st.session_state.pop("scan_control_message", None)
+    if control_message:
+        st.info(control_message)
     if not active:
-        st.info("No scans are running. Start a new authorized scan to see per-tool progress here.")
+        st.info("No scans are active. Start a new authorized scan to see per-tool progress here.")
     for assessment in active:
         results = assessment.get("scanner_results", {})
-        done = sum(result.get("status") in {"complete", "failed"} for result in results.values())
+        done = sum(result.get("status") in {"complete", "failed", "cancelled"} for result in results.values())
         with st.container(border=True):
             header, view = st.columns([4, 1])
             header.markdown(f"**{assessment.get('target', 'Assessment')}** · `{assessment['id'][:8]}`")
             if view.button("Open", key=f"open_active_{assessment['id']}",
                            on_click=_open_assessment, args=(assessment["id"],)):
                 st.rerun(scope="app")
+            controls = st.columns(3)
+            state = assessment.get("status")
+            if state == "running":
+                controls[0].button("Pause after tool", key=f"pause_scan_{assessment['id']}",
+                                   on_click=_set_scan_control, args=(assessment["id"], "paused"))
+                controls[1].button("Stop after tool", key=f"stop_scan_{assessment['id']}",
+                                   on_click=_set_scan_control, args=(assessment["id"], "stopping"))
+            elif state == "paused":
+                controls[0].button("Resume scan", key=f"resume_scan_{assessment['id']}",
+                                   on_click=_set_scan_control, args=(assessment["id"], ""))
+                controls[1].button("Stop scan", key=f"stop_paused_scan_{assessment['id']}",
+                                   on_click=_set_scan_control, args=(assessment["id"], "stopping"))
+            elif state == "stopping":
+                controls[0].warning("Stopping after current tool…")
             overall = done / max(1, len(results))
             st.progress(overall, text=f"{done} of {len(results)} tools finished")
             for scanner, result in results.items():
@@ -337,6 +363,8 @@ def _dashboard_page() -> None:
                     cols[1].success(f"Complete · {result.get('count', 0)} findings")
                 elif status == "failed":
                     cols[1].error("Failed")
+                elif status == "cancelled":
+                    cols[1].caption("Cancelled")
                 elif status == "running":
                     cols[1].info("Running")
                 else:
@@ -689,7 +717,22 @@ def _history_page() -> None:
 
         action_cols = st.columns(3)
         imported = any(item.get("mode") == "imported report" for item in assessment.get("scanner_results", {}).values())
-        can_rerun = assessment.get("status") != "running" and not imported and bool(assessment.get("scanners"))
+        active_status = assessment.get("status") in {"running", "paused", "stopping"}
+        if assessment.get("status") == "running":
+            control_left, control_middle, _ = st.columns(3)
+            control_left.button("Pause after current tool", key=f"history_pause_{assessment['id']}",
+                                on_click=_set_scan_control, args=(assessment["id"], "paused"))
+            control_middle.button("Stop after current tool", key=f"history_stop_{assessment['id']}",
+                                  on_click=_set_scan_control, args=(assessment["id"], "stopping"))
+        elif assessment.get("status") == "paused":
+            control_left, control_middle, _ = st.columns(3)
+            control_left.button("Resume scan", key=f"history_resume_{assessment['id']}",
+                                on_click=_set_scan_control, args=(assessment["id"], ""))
+            control_middle.button("Stop scan", key=f"history_stop_paused_{assessment['id']}",
+                                  on_click=_set_scan_control, args=(assessment["id"], "stopping"))
+        elif assessment.get("status") == "stopping":
+            st.info("Stop requested. The current scanner will finish before this scan can be deleted.")
+        can_rerun = not active_status and not imported and bool(assessment.get("scanners"))
         rerun_authorized = st.checkbox(
             "I confirm this target is still authorized for another scan.",
             key=f"rerun_authorized_{assessment['id']}", disabled=not can_rerun,
@@ -698,7 +741,7 @@ def _history_page() -> None:
             "Re-run scan", type="primary", disabled=not (can_rerun and rerun_authorized),
             key=f"rerun_scan_{assessment['id']}", on_click=_rerun_from_history, args=(assessment["id"],),
         )
-        if action_cols[2].button("Delete scan", disabled=assessment.get("status") == "running", key=f"request_delete_{assessment['id']}"):
+        if action_cols[2].button("Delete scan", disabled=active_status, key=f"request_delete_{assessment['id']}"):
             st.session_state["pending_delete_assessment"] = assessment["id"]
             st.rerun()
         if st.session_state.get("pending_delete_assessment") == assessment["id"]:

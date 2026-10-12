@@ -47,6 +47,12 @@ def _connect() -> sqlite3.Connection:
             heartbeat REAL NOT NULL
         )
     """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS assessment_controls (
+            assessment_id TEXT PRIMARY KEY,
+            control TEXT NOT NULL
+        )
+    """)
     existing = {row["name"] for row in connection.execute("PRAGMA table_info(assessments)")}
     for name, declaration in (
         ("group_id", "TEXT NOT NULL DEFAULT ''"),
@@ -101,6 +107,44 @@ def save_analysis(assessment_id: str, analysis: str) -> bool:
         connection.execute("UPDATE assessments SET analyses = ? WHERE id = ?", (json.dumps(analyses), assessment_id))
         connection.commit()
     return True
+
+
+def set_assessment_control(assessment_id: str, control: str) -> bool:
+    """Persist a queue control request without replacing scanner progress."""
+    if control not in {"", "paused", "stopping"}:
+        raise ValueError("Unsupported assessment control request.")
+    with closing(_connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute("SELECT status FROM assessments WHERE id = ?", (assessment_id,)).fetchone()
+        if not row or row["status"] not in {"running", "paused", "stopping"}:
+            connection.rollback()
+            return False
+        if control:
+            connection.execute(
+                "INSERT INTO assessment_controls(assessment_id, control) VALUES (?, ?) "
+                "ON CONFLICT(assessment_id) DO UPDATE SET control=excluded.control",
+                (assessment_id, control),
+            )
+        else:
+            connection.execute("DELETE FROM assessment_controls WHERE assessment_id = ?", (assessment_id,))
+        if control == "stopping":
+            connection.execute("UPDATE assessments SET status = 'stopping' WHERE id = ?", (assessment_id,))
+        elif control == "":
+            connection.execute("UPDATE assessments SET status = 'running' WHERE id = ?", (assessment_id,))
+        connection.commit()
+    return True
+
+
+def get_assessment_control(assessment_id: str) -> str:
+    with closing(_connect()) as connection:
+        row = connection.execute("SELECT control FROM assessment_controls WHERE assessment_id = ?", (assessment_id,)).fetchone()
+    return str(row["control"]) if row else ""
+
+
+def clear_assessment_control(assessment_id: str) -> None:
+    with closing(_connect()) as connection:
+        connection.execute("DELETE FROM assessment_controls WHERE assessment_id = ?", (assessment_id,))
+        connection.commit()
 
 
 def _decode(row: sqlite3.Row) -> dict[str, Any]:
@@ -184,7 +228,11 @@ def recover_interrupted_assessments() -> int:
 
 def list_pending_assessments() -> list[dict[str, Any]]:
     with closing(_connect()) as connection:
-        rows = connection.execute("SELECT * FROM assessments WHERE status = 'running' ORDER BY created_at ASC").fetchall()
+        rows = connection.execute(
+            "SELECT * FROM assessments WHERE status IN ('running', 'stopping') "
+            "OR id IN (SELECT assessment_id FROM assessment_controls WHERE control = 'stopping') "
+            "ORDER BY created_at ASC"
+        ).fetchall()
     return [_decode(row) for row in rows]
 
 
@@ -260,6 +308,7 @@ def delete_assessment(assessment_id: str) -> dict[str, Any] | None:
             return None
         assessment = _decode(row)
         connection.execute("DELETE FROM assessments WHERE id = ?", (assessment_id,))
+        connection.execute("DELETE FROM assessment_controls WHERE assessment_id = ?", (assessment_id,))
         connection.commit()
     return assessment
 

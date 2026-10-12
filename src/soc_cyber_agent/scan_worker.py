@@ -14,6 +14,8 @@ from .scanner_runner import run_scan
 from .storage import (
     claim_scan_worker,
     data_dir,
+    clear_assessment_control,
+    get_assessment_control,
     get_assessment,
     list_pending_assessments,
     release_scan_worker,
@@ -99,6 +101,20 @@ def _run_assessment(assessment_id: str) -> None:
         assessment = get_assessment(assessment_id)
         if not assessment:
             return
+        config = assessment.get("scan_config", {})
+        control = get_assessment_control(assessment_id)
+        if control == "paused":
+            assessment["status"] = "paused"
+            save_assessment(assessment)
+            return
+        if control == "stopping":
+            for pending_result in assessment.get("scanner_results", {}).values():
+                if pending_result.get("status") in {"queued", "running"}:
+                    pending_result.update(status="cancelled", detail="Not started because this assessment was stopped")
+            assessment["status"] = "stopped"
+            save_assessment(assessment)
+            clear_assessment_control(assessment_id)
+            return
         result = assessment.get("scanner_results", {}).get(scanner, {})
         if result.get("status") not in {"queued", "running"}:
             continue
@@ -146,6 +162,19 @@ def _run_assessment(assessment_id: str) -> None:
 
     latest = get_assessment(assessment_id)
     if not latest:
+        return
+    control = get_assessment_control(assessment_id)
+    if control == "paused":
+        latest["status"] = "paused"
+        save_assessment(latest)
+        return
+    if control == "stopping":
+        for pending_result in latest.get("scanner_results", {}).values():
+            if pending_result.get("status") in {"queued", "running"}:
+                pending_result.update(status="cancelled", detail="Not started because this assessment was stopped")
+        latest["status"] = "stopped"
+        save_assessment(latest)
+        clear_assessment_control(assessment_id)
         return
     statuses = [item.get("status") for item in latest.get("scanner_results", {}).values()]
     complete_count = sum(status == "complete" for status in statuses)
