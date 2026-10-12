@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from pathlib import Path, PurePosixPath
+import shutil
 from typing import Any
 from uuid import uuid4
 
@@ -16,7 +17,7 @@ from soc_cyber_agent.scan_worker import ensure_scan_worker_started
 from soc_cyber_agent.scanner_runner import SCANNERS, ScannerError, normalize_burp_seed, scanner_availability, validate_web_target
 from soc_cyber_agent.tool_catalog import TOOL_CATEGORIES, catalog_tool_status
 from soc_cyber_agent.storage import (
-    data_dir, delete_assessment, get_assessment, list_assessment_scans,
+    clear_all_assessments, data_dir, delete_assessment, get_assessment, list_assessment_scans,
     list_assessments, new_assessment, next_scan_number, recover_interrupted_assessments, save_analysis, save_assessment,
     set_assessment_control,
 )
@@ -89,6 +90,28 @@ def _delete_assessment_and_evidence(assessment_id: str) -> tuple[bool, str]:
         except OSError as exc:
             errors.append(str(exc))
     return True, "Assessment deleted." + (f" Some raw files could not be removed: {'; '.join(errors)}" if errors else "")
+
+
+def _wipe_all_assessments() -> tuple[bool, str]:
+    removed = clear_all_assessments()
+    if removed is None:
+        return False, "Wipe cancelled: stop or finish all active scans first."
+    raw_dir = data_dir() / "raw"
+    evidence_note = ""
+    if raw_dir.is_symlink():
+        evidence_note = " Raw evidence was retained because the raw directory is a symbolic link."
+    else:
+        try:
+            if raw_dir.exists():
+                shutil.rmtree(raw_dir)
+            raw_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            evidence_note = f" Some raw evidence could not be removed: {exc}"
+    st.session_state.pop("current_assessment_id", None)
+    st.session_state.pop("history_selected_scan", None)
+    st.session_state.pop("pending_delete_assessment", None)
+    st.session_state["wipe_confirmation_epoch"] = int(st.session_state.get("wipe_confirmation_epoch", 0)) + 1
+    return True, f"Wiped {len(removed)} assessment record(s) and their raw evidence.{evidence_note}"
 
 
 def _rerun_from_history(assessment_id: str) -> None:
@@ -631,6 +654,9 @@ def _settings_page() -> None:
     st.markdown("<div class='eyebrow'>CONNECTIONS</div>", unsafe_allow_html=True)
     st.title("Settings")
     st.write("Configure the cloud AI endpoint and scanner connections used by future assessments.")
+    wipe_message = st.session_state.pop("settings_wipe_message", None)
+    if wipe_message:
+        (st.success if wipe_message[0] else st.error)(wipe_message[1])
     settings = load_app_settings()
     with st.container(border=True):
         st.subheader("Online AI analysis")
@@ -689,6 +715,22 @@ def _settings_page() -> None:
             st.rerun()
         except (OSError, ValueError) as exc:
             st.error(f"Could not remove cloud AI API key: {exc}")
+
+    active_assessments = [
+        item for item in list_assessments()
+        if item.get("status") in {"running", "paused", "stopping"}
+    ]
+    with st.container(border=True):
+        st.subheader("Danger zone")
+        st.warning("This permanently deletes every saved assessment, finding, AI analysis, and file under data/raw/. This cannot be undone.")
+        if active_assessments:
+            st.info(f"Stop or finish {len(active_assessments)} active scan(s) before wiping history.")
+        wipe_epoch = int(st.session_state.get("wipe_confirmation_epoch", 0))
+        confirm_wipe = st.checkbox("I understand this permanently erases all assessment history and raw evidence.", key=f"confirm_wipe_all_assessments_{wipe_epoch}")
+        if st.button("Wipe all assessment history", disabled=not confirm_wipe or bool(active_assessments), key="wipe_all_assessments"):
+            success, message = _wipe_all_assessments()
+            st.session_state["settings_wipe_message"] = (success, message)
+            st.rerun()
 
 
 def _history_page() -> None:

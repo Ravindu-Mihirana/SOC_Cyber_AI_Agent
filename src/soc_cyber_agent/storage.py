@@ -313,6 +313,21 @@ def delete_assessment(assessment_id: str) -> dict[str, Any] | None:
     return assessment
 
 
+def clear_all_assessments() -> list[dict[str, Any]] | None:
+    """Atomically remove all saved assessments, refusing while any scan is active."""
+    with closing(_connect()) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute("SELECT * FROM assessments ORDER BY created_at DESC").fetchall()
+        assessments = [_decode(row) for row in rows]
+        if any(item.get("status") in {"running", "paused", "stopping"} for item in assessments):
+            connection.rollback()
+            return None
+        connection.execute("DELETE FROM assessments")
+        connection.execute("DELETE FROM assessment_controls")
+        connection.commit()
+    return assessments
+
+
 def new_assessment(target: str, scanners: list[str], *, group_id: str | None = None,
                    scan_number: int = 1, scan_config: dict[str, Any] | None = None) -> dict[str, Any]:
     from uuid import uuid4
