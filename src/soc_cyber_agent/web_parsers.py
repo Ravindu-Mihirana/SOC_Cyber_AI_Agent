@@ -26,9 +26,20 @@ def parse_nikto_json(path: str | Path, *, target: str, job_id: str) -> list[Find
     """Parse Nikto JSON findings; leave severity unknown unless supplied."""
     data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     host, port, protocol = _web_location(target, "")
+    # Nikto releases commonly emit either an array of report objects or one
+    # report object whose `vulnerabilities` field contains the findings.
+    if isinstance(data, list):
+        if len(data) == 1 and isinstance(data[0], dict):
+            data = data[0]
+        elif all(isinstance(item, dict) for item in data):
+            data = {"vulnerabilities": data}
     if not isinstance(data, dict):
-        raise ValueError("Nikto JSON report must contain an object at its root.")
+        raise ValueError("Nikto JSON report must contain an object or array at its root.")
     vulnerabilities = next((data[key] for key in ("vulnerabilities", "findings", "results", "items") if isinstance(data.get(key), list)), None)
+    if vulnerabilities is None and isinstance(data.get("scan_details"), dict):
+        vulnerabilities = next((data["scan_details"].get(key) for key in ("vulnerabilities", "findings", "results", "items") if isinstance(data["scan_details"].get(key), list)), None)
+    if vulnerabilities is None and any(key in data for key in ("msg", "message", "description", "OSVDB")):
+        vulnerabilities = [data]
     if vulnerabilities is None:
         raise ValueError("Unrecognized Nikto JSON report structure.")
     findings: list[Finding] = []

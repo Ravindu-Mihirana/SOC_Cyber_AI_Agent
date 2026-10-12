@@ -139,7 +139,8 @@ def _run(args: list[str], *, timeout: int, allow_nonzero: bool = False,
          control_check: Callable[[], str] | None = None,
          env: dict[str, str] | None = None,
          on_progress: Callable[[str], None] | None = None,
-         progress_label: str = "Scanner") -> subprocess.CompletedProcess[str]:
+         progress_label: str = "Scanner",
+         log_path: Path | None = None) -> subprocess.CompletedProcess[str]:
     output_file = tempfile.TemporaryFile(mode="w+b")
     try:
         process_options: dict[str, object] = {"stdout": output_file, "stderr": subprocess.STDOUT}
@@ -165,6 +166,8 @@ def _run(args: list[str], *, timeout: int, allow_nonzero: bool = False,
             _terminate_process(process)
             output_file.seek(0)
             detail = output_file.read().decode("utf-8", "replace")
+            if log_path:
+                log_path.write_text(detail, encoding="utf-8", errors="replace")
             output_file.close()
             raise ScannerError(f"Scan timed out after {timeout} seconds. {detail[-2500:]}".strip())
         now = time.monotonic()
@@ -175,6 +178,8 @@ def _run(args: list[str], *, timeout: int, allow_nonzero: bool = False,
     output_file.seek(0)
     output = output_file.read().decode("utf-8", "replace")
     output_file.close()
+    if log_path:
+        log_path.write_text(output, encoding="utf-8", errors="replace")
     completed = subprocess.CompletedProcess(args, process.returncode, output, "")
     if completed.returncode != 0 and not allow_nonzero:
         detail = (completed.stderr or completed.stdout or "No scanner error details were returned.").strip()
@@ -315,9 +320,10 @@ def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api
                     break
             if state == "paused" and (not detail or "seed" in detail.casefold()):
                 detail = (detail + " " if detail else "") + (
-                    "Burp could not connect to any seed URLs. Verify DNS resolution, outbound network access, "
-                    "TLS/certificate trust, and redirects from the machine running Burp. If the site redirects "
-                    "to another hostname, use that final URL and include it in the authorized scan scope."
+                    "Burp could not connect to any seed URLs. Test the exact seed from the machine running Burp "
+                    "with curl -IL '<seed-url>'. Fix DNS, routing/firewall, proxy, or TLS trust there; redirects "
+                    "to another hostname must be reachable and included in Burp's authorized scope. If this URL "
+                    "works only from the app VM, Burp is running on a different machine/network."
                 )
             raise ScannerError(f"Burp scan {task_id} ended with status: {state}. {detail}".strip())
         if state in {"succeeded", "completed", "complete", "finished"} or str(progress) == "100":
@@ -502,7 +508,7 @@ def run_scan(
             raise ScannerError("Nikto was not found. Install Nikto and Perl, or set NIKTO_SCRIPT to nikto.pl.")
         raw_path = raw_dir / f"{job_id}-nikto.json"
         args = command + ["-h", target, "-output", str(raw_path), "-Format", "json", "-maxtime", "5m", "-timeout", "10", "-nointeractive", "-nocheck"]
-        completed = _run(args, timeout=360, allow_nonzero=True, control_check=control_check, on_progress=on_progress, progress_label=scanner)
+        completed = _run(args, timeout=360, allow_nonzero=True, control_check=control_check, on_progress=on_progress, progress_label=scanner, log_path=raw_dir / f"{job_id}-nikto.log")
         console_output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
         log_path = raw_dir / f"{job_id}-nikto.log"
         if console_output:
@@ -516,10 +522,12 @@ def run_scan(
                 json_parsed = True
             except (OSError, ValueError) as exc:
                 output_error = str(exc)
-        if not findings and console_output:
-            findings = parse_nikto_text(console_output, target=target, job_id=job_id)
-            if findings:
-                raw_path = log_path
+        # Nikto's text output can contain useful findings even when its JSON
+        # output is a valid but unsupported list/object shape.
+        if not findings and log_path.is_file():
+            findings = parse_nikto_text(log_path.read_text(encoding="utf-8", errors="replace"), target=target, job_id=job_id)
+        if findings and (not raw_path.is_file() or not raw_path.stat().st_size):
+            raw_path = log_path
         if completed.returncode != 0 and not findings:
             detail = console_output[-2500:] or f"Nikto exited with code {completed.returncode}."
             if output_error:
@@ -542,7 +550,28 @@ def run_scan(
             raise ScannerError("Choose an existing local wordlist file for Gobuster.")
         raw_path = raw_dir / f"{job_id}-gobuster.txt"
         args = [executable, "dir", "-u", target, "-w", str(wordlist_path.resolve()), "-t", "2" if vm_safe else "10", "-q", "-o", str(raw_path)]
-        _run(args, timeout=1800, control_check=control_check, on_progress=on_progress, progress_label=scanner)
+        # A wildcard response means unknown paths resemble valid resources.
+        # Gobuster reports the measured body length; retry once with that exact
+        # length excluded rather than turning the false positives into results.
+        gobuster_exclude_length = str(os.environ.get("GOBUSTER_EXCLUDE_LENGTH", "")).strip()
+        if gobuster_exclude_length:
+            if not re.fullmatch(r"\d+(,\d+)*", gobuster_exclude_length):
+                raise ScannerError("GOBUSTER_EXCLUDE_LENGTH must be a comma-separated list of response byte lengths.")
+            args += ["--exclude-length", gobuster_exclude_length]
+        completed = _run(args, timeout=1800, allow_nonzero=True, control_check=control_check,
+                         on_progress=on_progress, progress_label=scanner, log_path=raw_path)
+        if completed.returncode != 0:
+            output = completed.stdout or ""
+            wildcard = re.search(r"(?:Length|length)\s*[:=]\s*(\d+)", output)
+            if not gobuster_exclude_length and wildcard:
+                excluded_length = wildcard.group(1)
+                retry_args = args + ["--exclude-length", excluded_length]
+                completed = _run(retry_args, timeout=1800, allow_nonzero=True,
+                                 control_check=control_check, on_progress=on_progress,
+                                 progress_label=scanner, log_path=raw_path)
+            if completed.returncode != 0:
+                detail = (completed.stdout or "Gobuster returned no diagnostic output.").strip()
+                raise ScannerError(f"Gobuster exited with code {completed.returncode}. Check that the target is reachable and that the wordlist is valid. Output:\n{detail[-4000:]}")
         findings = parse_gobuster_text(raw_path, target=target, job_id=job_id)
     elif scanner == "nuclei":
         _check_url(target)
@@ -587,17 +616,18 @@ def run_scan(
         if vm_safe:
             zap_args.append("-lowmem")
         zap_args += ["-quickurl", target, "-quickout", str(raw_path)]
+        zap_log = raw_dir / f"{job_id}-zap.log"
         completed = _run(zap_args, timeout=3600, allow_nonzero=True,
                          control_check=control_check, env=zap_env,
-                         on_progress=on_progress, progress_label=scanner)
+                         on_progress=on_progress, progress_label=scanner, log_path=zap_log)
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "No output from ZAP.").strip()
-            raise ScannerError(f"ZAP exited with code {completed.returncode} using proxy port {proxy_port}: {detail[-2500:]}")
+            raise ScannerError(f"ZAP exited with code {completed.returncode} using proxy port {proxy_port}. Full output saved to raw/{zap_log.name}. Last output:\n{detail[-8000:]}")
         if not raw_path.is_file():
             detail = (completed.stderr or completed.stdout or "ZAP exited without creating its JSON report.").strip()
             if "address already in use" in detail.casefold():
                 detail += " The chosen local proxy port was occupied; close the competing proxy and retry."
-            raise ScannerError(f"ZAP produced no report on proxy port {proxy_port}: {detail[-2500:]}")
+            raise ScannerError(f"ZAP produced no report on proxy port {proxy_port}. Full output saved to raw/{zap_log.name}. Last output:\n{detail[-8000:]}")
         findings = _parse_zap(raw_path, target, job_id)
     elif scanner == "sqlmap":
         _check_url(target)

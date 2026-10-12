@@ -603,6 +603,8 @@ def _new_assessment_page() -> None:
                     st.caption(f"Found: {wordlist}")
                 else:
                     st.warning(f"Not installed at {wordlist}. Install the corresponding Kali wordlists package or choose another path.")
+        if "gobuster" in scanners:
+            st.caption("If Gobuster reports that unknown URLs return a fixed status/length, set GOBUSTER_EXCLUDE_LENGTH to that response length in bytes, then restart the app. The tool will not guess this value.")
         if any(name in scanners for name in ("zap", "sqlmap")):
             st.warning("ZAP Quick Start and sqlmap send active test requests to the target. Use only on applications you are authorized to test.")
         approved = st.checkbox("I own these targets or have explicit permission to scan them.")
