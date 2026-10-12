@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .app_settings import load_app_settings
-from .scanner_runner import run_scan
+from .scanner_runner import ScanControlRequested, run_scan
 from .storage import (
     claim_scan_worker,
     data_dir,
@@ -145,6 +145,7 @@ def _run_assessment(assessment_id: str) -> None:
                 burp_profile=str(config.get("burp_profile", "")),
                 nmap_options=config.get("nmap_options", {}),
                 on_progress=report_progress if scanner == "burp" else None,
+                control_check=lambda: get_assessment_control(assessment_id),
             )
             latest = get_assessment(assessment_id)
             if not latest:
@@ -155,6 +156,27 @@ def _run_assessment(assessment_id: str) -> None:
                 "raw_path": raw_path, "progress": 100,
             }
             save_assessment(latest)
+        except ScanControlRequested:
+            latest = get_assessment(assessment_id)
+            if not latest:
+                return
+            requested = get_assessment_control(assessment_id)
+            if requested == "stopping":
+                for pending_result in latest.get("scanner_results", {}).values():
+                    if pending_result.get("status") in {"queued", "running"}:
+                        pending_result.update(status="cancelled", detail="Cancelled by stop request")
+                latest["status"] = "stopped"
+                save_assessment(latest)
+                clear_assessment_control(assessment_id)
+                return
+            latest["scanner_results"][scanner].update(
+                status="queued", progress=0,
+                detail="Paused. Resume will restart this scanner from the beginning.",
+                error="",
+            )
+            latest["status"] = "paused"
+            save_assessment(latest)
+            return
         except Exception as exc:
             _persist_scanner_state(assessment_id, scanner, {
                 "status": "failed", "target": target, "error": str(exc), "progress": 100,

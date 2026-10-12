@@ -54,8 +54,8 @@ def _open_assessment(assessment_id: str) -> None:
 
 def _set_scan_control(assessment_id: str, control: str) -> None:
     if set_assessment_control(assessment_id, control):
-        labels = {"paused": "Pause requested. It will pause after the current tool finishes.",
-                  "stopping": "Stop requested. The current tool will finish before the scan stops.",
+        labels = {"paused": "Pause requested. Local tools pause now and restart from the beginning when resumed; Burp finishes its current task first.",
+                  "stopping": "Stop requested. Local tools stop now; cancel an active Burp task in Burp Suite.",
                   "": "Scan resumed."}
         st.session_state["scan_control_message"] = labels[control]
 
@@ -308,6 +308,7 @@ def _render_assessment(assessment: dict[str, Any]) -> None:
 
 @st.fragment(run_every=3)
 def _dashboard_page() -> None:
+    worker_ready = ensure_scan_worker_started()
     assessments = list_assessments()
     active = [item for item in assessments if item.get("status") in {"running", "paused", "stopping"}]
     all_findings = sum(len(item.get("findings", [])) for item in assessments)
@@ -325,6 +326,9 @@ def _dashboard_page() -> None:
     m4.metric("Available tools", f"{sum(ready for ready, _ in scanner_availability().values())}/{len(SCANNERS)}")
 
     st.markdown("### Live scan progress")
+    if not worker_ready and active:
+        st.error("The scan worker is unavailable. Check data/logs/scan-worker.log; queued stop requests will remain pending until it starts.")
+    st.caption("Local scanner processes stop immediately. Burp runs inside Burp Suite, so cancel its active task there; resuming a paused local tool restarts that tool.")
     control_message = st.session_state.pop("scan_control_message", None)
     if control_message:
         st.info(control_message)
@@ -342,9 +346,9 @@ def _dashboard_page() -> None:
             controls = st.columns(3)
             state = assessment.get("status")
             if state == "running":
-                controls[0].button("Pause after tool", key=f"pause_scan_{assessment['id']}",
+                controls[0].button("Pause scan", key=f"pause_scan_{assessment['id']}",
                                    on_click=_set_scan_control, args=(assessment["id"], "paused"))
-                controls[1].button("Stop after tool", key=f"stop_scan_{assessment['id']}",
+                controls[1].button("Stop scan", key=f"stop_scan_{assessment['id']}",
                                    on_click=_set_scan_control, args=(assessment["id"], "stopping"))
             elif state == "paused":
                 controls[0].button("Resume scan", key=f"resume_scan_{assessment['id']}",
@@ -720,9 +724,9 @@ def _history_page() -> None:
         active_status = assessment.get("status") in {"running", "paused", "stopping"}
         if assessment.get("status") == "running":
             control_left, control_middle, _ = st.columns(3)
-            control_left.button("Pause after current tool", key=f"history_pause_{assessment['id']}",
+            control_left.button("Pause scan", key=f"history_pause_{assessment['id']}",
                                 on_click=_set_scan_control, args=(assessment["id"], "paused"))
-            control_middle.button("Stop after current tool", key=f"history_stop_{assessment['id']}",
+            control_middle.button("Stop scan", key=f"history_stop_{assessment['id']}",
                                   on_click=_set_scan_control, args=(assessment["id"], "stopping"))
         elif assessment.get("status") == "paused":
             control_left, control_middle, _ = st.columns(3)
@@ -731,7 +735,7 @@ def _history_page() -> None:
             control_middle.button("Stop scan", key=f"history_stop_paused_{assessment['id']}",
                                   on_click=_set_scan_control, args=(assessment["id"], "stopping"))
         elif assessment.get("status") == "stopping":
-            st.info("Stop requested. The current scanner will finish before this scan can be deleted.")
+            st.info("Stop requested. Local scanner termination is in progress. If Burp is active, cancel its task in Burp Suite; deletion unlocks once the dashboard marks this scan stopped.")
         can_rerun = not active_status and not imported and bool(assessment.get("scanners"))
         rerun_authorized = st.checkbox(
             "I confirm this target is still authorized for another scan.",

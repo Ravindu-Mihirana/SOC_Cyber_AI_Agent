@@ -8,6 +8,8 @@ import uuid
 import json
 import time
 import socket
+import signal
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
@@ -26,6 +28,12 @@ SCANNERS = ("nmap", "burp", "nikto", "gobuster", "zap", "nuclei", "ffuf", "sqlma
 
 class ScannerError(RuntimeError):
     pass
+
+
+class ScanControlRequested(RuntimeError):
+    def __init__(self, control: str):
+        super().__init__(control)
+        self.control = control
 
 
 def _nikto_command() -> list[str] | None:
@@ -102,13 +110,63 @@ def normalize_burp_seed(target: str) -> str:
     return urlunparse((parsed.scheme.lower(), netloc, path, parsed.params, parsed.query, ""))
 
 
-def _run(args: list[str], *, timeout: int, allow_nonzero: bool = False) -> subprocess.CompletedProcess[str]:
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    """Terminate a scanner and its child processes where supported."""
+    if process.poll() is not None:
+        return
     try:
-        completed = subprocess.run(args, capture_output=True, text=True, timeout=timeout, check=False)
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                           capture_output=True, timeout=8, check=False)
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            process.kill()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _run(args: list[str], *, timeout: int, allow_nonzero: bool = False,
+         control_check: Callable[[], str] | None = None) -> subprocess.CompletedProcess[str]:
+    output_file = tempfile.TemporaryFile(mode="w+b")
+    try:
+        process_options: dict[str, object] = {"stdout": output_file, "stderr": subprocess.STDOUT}
+        if os.name == "nt":
+            process_options["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+        else:
+            process_options["start_new_session"] = True
+        process = subprocess.Popen(args, **process_options)
     except FileNotFoundError as exc:
+        output_file.close()
         raise ScannerError(f"Scanner executable not found: {args[0]}") from exc
-    except subprocess.TimeoutExpired as exc:
-        raise ScannerError(f"Scan timed out after {timeout} seconds.") from exc
+    deadline = time.monotonic() + timeout
+    while process.poll() is None:
+        if control_check:
+            control = control_check()
+            if control in {"paused", "stopping"}:
+                _terminate_process(process)
+                output_file.close()
+                raise ScanControlRequested(control)
+        if time.monotonic() >= deadline:
+            _terminate_process(process)
+            output_file.seek(0)
+            detail = output_file.read().decode("utf-8", "replace")
+            output_file.close()
+            raise ScannerError(f"Scan timed out after {timeout} seconds. {detail[-2500:]}".strip())
+        time.sleep(0.25)
+    output_file.seek(0)
+    output = output_file.read().decode("utf-8", "replace")
+    output_file.close()
+    completed = subprocess.CompletedProcess(args, process.returncode, output, "")
     if completed.returncode != 0 and not allow_nonzero:
         detail = (completed.stderr or completed.stdout or "No scanner error details were returned.").strip()
         raise ScannerError(detail[-2500:])
@@ -186,6 +244,7 @@ def _burp_issue_findings(issues_response: object, *, target: str, job_id: str) -
 
 def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api_key: str,
                    profile: str = "", on_progress: Callable[[str], None] | None = None,
+                   control_check: Callable[[], str] | None = None,
                    timeout: int = 7200) -> tuple[list[Finding], Path, str]:
     """Start and monitor a Burp scan, then persist the API's raw issue response."""
     target = normalize_burp_seed(target)
@@ -219,7 +278,16 @@ def _run_burp_scan(target: str, *, raw_dir: Path, job_id: str, api_url: str, api
     deadline = time.monotonic() + timeout
     status: object = {}
     last_progress: object = None
+    control_notice_sent = False
     while time.monotonic() < deadline:
+        control = control_check() if control_check else ""
+        if control in {"paused", "stopping"} and not control_notice_sent:
+            if on_progress:
+                on_progress(
+                    "Pause/stop requested. Burp owns this task and the app cannot terminate it; "
+                    "cancel the task in Burp Suite to finish immediately."
+                )
+            control_notice_sent = True
         status = _burp_request(api_url, api_key.strip(), f"scan/{quote(str(task_id), safe='')}", timeout=60)
         if not isinstance(status, dict):
             raise ScannerError("Burp returned an invalid scan status response.")
@@ -358,6 +426,7 @@ def run_scan(
     burp_profile: str = "",
     nmap_options: dict[str, object] | None = None,
     on_progress: Callable[[str], None] | None = None,
+    control_check: Callable[[], str] | None = None,
 ) -> tuple[list[dict[str, object]], str]:
     """Execute one scan and return normalized findings plus the raw-output path."""
     if scanner not in SCANNERS:
@@ -370,6 +439,7 @@ def run_scan(
         findings, raw_path, _task_id = _run_burp_scan(
             target, raw_dir=raw_dir, job_id=job_id, api_url=burp_api_url,
             api_key=burp_api_key, profile=burp_profile, on_progress=on_progress,
+            control_check=control_check,
         )
         return [finding.to_dict() for finding in findings], raw_path.relative_to(data_dir()).as_posix()
 
@@ -410,7 +480,7 @@ def run_scan(
         if ports:
             args += ["-p", ports]
         args.append(target)
-        _run(args, timeout=900)
+        _run(args, timeout=900, control_check=control_check)
         findings = parse_nmap_xml(raw_path, target=target, job_id=job_id)
     elif scanner == "nikto":
         _check_url(target)
@@ -419,7 +489,7 @@ def run_scan(
             raise ScannerError("Nikto was not found. Install Nikto and Perl, or set NIKTO_SCRIPT to nikto.pl.")
         raw_path = raw_dir / f"{job_id}-nikto.json"
         args = command + ["-h", target, "-output", str(raw_path), "-Format", "json", "-maxtime", "5m", "-timeout", "10", "-nointeractive", "-nocheck"]
-        completed = _run(args, timeout=360, allow_nonzero=True)
+        completed = _run(args, timeout=360, allow_nonzero=True, control_check=control_check)
         console_output = "\n".join(part for part in (completed.stdout, completed.stderr) if part).strip()
         log_path = raw_dir / f"{job_id}-nikto.log"
         if console_output:
@@ -459,7 +529,7 @@ def run_scan(
             raise ScannerError("Choose an existing local wordlist file for Gobuster.")
         raw_path = raw_dir / f"{job_id}-gobuster.txt"
         args = [executable, "dir", "-u", target, "-w", str(wordlist_path.resolve()), "-t", "10", "-q", "-o", str(raw_path)]
-        _run(args, timeout=1800)
+        _run(args, timeout=1800, control_check=control_check)
         findings = parse_gobuster_text(raw_path, target=target, job_id=job_id)
     elif scanner == "nuclei":
         _check_url(target)
@@ -468,7 +538,7 @@ def run_scan(
             raise ScannerError("Nuclei executable was not found on PATH.")
         raw_path = raw_dir / f"{job_id}-nuclei.jsonl"
         args = [executable, "-u", target, "-jsonl", "-o", str(raw_path), "-rl", "10", "-timeout", "5", "-retries", "1", "-no-color"]
-        _run(args, timeout=1800)
+        _run(args, timeout=1800, control_check=control_check)
         findings = _parse_nuclei(raw_path, target, job_id)
     elif scanner == "ffuf":
         _check_url(target)
@@ -481,7 +551,7 @@ def run_scan(
         raw_path = raw_dir / f"{job_id}-ffuf.json"
         fuzz_url = target.rstrip("/") + "/FUZZ"
         args = [executable, "-u", fuzz_url, "-w", str(wordlist_path.resolve()), "-of", "json", "-o", str(raw_path), "-rate", "10", "-t", "10", "-maxtime", "1800", "-noninteractive"]
-        _run(args, timeout=1900)
+        _run(args, timeout=1900, control_check=control_check)
         findings = _parse_ffuf(raw_path, target, job_id)
     elif scanner == "zap":
         _check_url(target)
@@ -490,7 +560,7 @@ def run_scan(
             raise ScannerError("OWASP ZAP executable was not found on PATH.")
         raw_path = raw_dir / f"{job_id}-zap.json"
         proxy_port = _free_local_port()
-        completed = _run([executable, "-cmd", "-silent", "-port", str(proxy_port), "-quickurl", target, "-quickout", str(raw_path)], timeout=3600, allow_nonzero=True)
+        completed = _run([executable, "-cmd", "-silent", "-port", str(proxy_port), "-quickurl", target, "-quickout", str(raw_path)], timeout=3600, allow_nonzero=True, control_check=control_check)
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "No output from ZAP.").strip()
             raise ScannerError(f"ZAP exited with code {completed.returncode} using proxy port {proxy_port}: {detail[-2500:]}")
@@ -506,7 +576,7 @@ def run_scan(
         if not executable:
             raise ScannerError("sqlmap executable was not found on PATH.")
         output_dir = raw_dir / f"{job_id}-sqlmap"
-        completed = _run([executable, "-u", target, "--batch", "--smart", "--risk=1", "--level=1", "--crawl=1", "--output-dir", str(output_dir)], timeout=3600, allow_nonzero=True)
+        completed = _run([executable, "-u", target, "--batch", "--smart", "--risk=1", "--level=1", "--crawl=1", "--output-dir", str(output_dir)], timeout=3600, allow_nonzero=True, control_check=control_check)
         raw_path = raw_dir / f"{job_id}-sqlmap.txt"
         output = (completed.stdout or "") + "\n" + (completed.stderr or "")
         raw_path.write_text(output, encoding="utf-8", errors="replace")

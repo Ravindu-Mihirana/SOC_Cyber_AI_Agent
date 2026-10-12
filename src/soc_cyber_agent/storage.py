@@ -136,9 +136,9 @@ def set_assessment_control(assessment_id: str, control: str) -> bool:
 
 
 def get_assessment_control(assessment_id: str) -> str:
-    with closing(_connect()) as connection:
+    with closing(sqlite3.connect(db_path(), timeout=10)) as connection:
         row = connection.execute("SELECT control FROM assessment_controls WHERE assessment_id = ?", (assessment_id,)).fetchone()
-    return str(row["control"]) if row else ""
+    return str(row[0]) if row else ""
 
 
 def clear_assessment_control(assessment_id: str) -> None:
