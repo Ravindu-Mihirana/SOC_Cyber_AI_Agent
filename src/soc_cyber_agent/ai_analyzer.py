@@ -43,18 +43,21 @@ def analyze_assessment(
         "generic filler. Recommendations are advisory and require analyst validation."
     )
     compact = []
+    # Keep every finding and identifier, but scale evidence per finding so a
+    # large assessment does not create a needlessly enormous request/response.
+    per_field_limit = max(80, min(3000, 80_000 // max(1, 2 * len(findings))))
     for finding in findings:
         item = {key: finding.get(key) for key in (
             "id", "source_tool", "target", "host", "port", "protocol", "title", "description", "severity",
             "status", "cve_ids", "evidence", "service_name", "service_product", "service_version",
             "service_detection_method", "service_confidence",
         ) if key in finding}
-        # Keep useful evidence while preventing one oversized scanner record from
-        # crowding out the rest of the assessment context.
+        # Give the total evidence budget to all findings rather than letting a
+        # few large scanner records dominate the model context.
         for field in ("description", "evidence"):
             value = item.get(field)
-            if isinstance(value, str) and len(value) > 6000:
-                item[field] = value[:6000] + " …[truncated; see raw scanner evidence]"
+            if isinstance(value, str) and len(value) > per_field_limit:
+                item[field] = value[:per_field_limit] + " …[truncated; see raw scanner evidence]"
         compact.append(item)
     coverage = {
         name: {key: result.get(key) for key in ("status", "target", "count", "error", "detail", "mode") if key in result}
@@ -78,6 +81,10 @@ def list_models(*, base_url: str, api_key: str = "") -> list[str]:
         return []
     if base_url.endswith("/models"):
         endpoint = base_url
+    elif base_url.endswith("/v1beta/openai/chat/completions"):
+        endpoint = base_url.removesuffix("/chat/completions") + "/models"
+    elif base_url.endswith("/v1beta/openai"):
+        endpoint = f"{base_url}/models"
     elif base_url.endswith("/v1/chat/completions"):
         endpoint = f"{base_url.removesuffix('/chat/completions')}/models"
     elif base_url.endswith("/v1"):
@@ -109,6 +116,8 @@ def _request_analysis(system: str, user: str, *, base_url: str, model: str, api_
         raise AIAnalysisError("Only online HTTPS AI endpoints are supported. Configure the cloud endpoint in Settings.")
     if base_url.endswith("/chat/completions"):
         endpoint = base_url
+    elif base_url.endswith("/v1beta/openai"):
+        endpoint = f"{base_url}/chat/completions"
     elif base_url.endswith("/v1"):
         endpoint = f"{base_url}/chat/completions"
     else:
@@ -121,7 +130,7 @@ def _request_analysis(system: str, user: str, *, base_url: str, model: str, api_
         headers["Authorization"] = f"Bearer {api_key}"
     try:
         request = urllib.request.Request(endpoint, data=json.dumps(payload).encode("utf-8"), headers=headers, method="POST")
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with urllib.request.urlopen(request, timeout=600) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
@@ -143,9 +152,19 @@ def _request_analysis(system: str, user: str, *, base_url: str, model: str, api_
             ) from exc
         raise AIAnalysisError(f"AI provider returned HTTP {exc.code}. {detail}".strip()) from exc
     except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise AIAnalysisError(
+                f"The selected AI endpoint timed out while processing model {model}. "
+                "The scan results remain saved; retry later, or select a faster model/provider."
+            ) from exc
         raise AIAnalysisError(f"Could not reach the selected AI endpoint: {exc}") from exc
-    except (TimeoutError, json.JSONDecodeError) as exc:
-        raise AIAnalysisError(f"AI response could not be read: {exc}") from exc
+    except TimeoutError as exc:
+        raise AIAnalysisError(
+            f"The selected AI endpoint did not return data within 10 minutes for model {model}. "
+            "The scan results remain saved; retry later, or select a faster model/provider."
+        ) from exc
+    except json.JSONDecodeError as exc:
+        raise AIAnalysisError("The AI endpoint returned a response that was not valid JSON.") from exc
     except ValueError as exc:
         raise AIAnalysisError("Enter a valid AI endpoint URL.") from exc
     choices = result.get("choices", [])

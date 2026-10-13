@@ -249,16 +249,17 @@ def _render_ai(assessment: dict[str, Any]) -> None:
         key=f"ai_allow_send_{assessment['id']}",
     )
     if st.button("Analyze all tool results", type="primary", disabled=not allow_send or not settings["ai_api_key"], key=f"analyze_all_{assessment['id']}"):
-        with st.spinner("Analyzing normalized findings…"):
+        with st.spinner("Analyzing normalized findings… Large scans may take several minutes."):
             try:
                 analysis = analyze_assessment(
                     str(assessment.get("target", "")), findings, assessment.get("scanner_results", {}),
                     base_url=settings["ai_base_url"], model=settings["ai_model"], api_key=settings["ai_api_key"],
                 )
             except AIAnalysisError as exc:
-                analysis = f"Analysis unavailable: {exc}"
-            save_analysis(str(assessment["id"]), analysis)
-        st.rerun()
+                st.error(f"Analysis unavailable: {exc}")
+            else:
+                save_analysis(str(assessment["id"]), analysis)
+                st.rerun()
     analyses = assessment.get("analyses", {})
     if analyses.get("unified"):
         st.markdown(str(analyses["unified"]))
@@ -681,9 +682,9 @@ def _settings_page() -> None:
     settings = load_app_settings()
     with st.container(border=True):
         st.subheader("Online AI analysis")
-        st.caption("Use an HTTPS endpoint that implements the OpenAI chat completions and model-list APIs. The API key is saved locally in the ignored data/app-settings.json file.")
+        st.caption("Use an HTTPS OpenAI-compatible endpoint. For Google AI Studio / Gemini, use https://generativelanguage.googleapis.com/v1beta/openai/. The API key is saved locally in the ignored data/app-settings.json file.")
         ai_base_url = st.text_input("Cloud AI base URL", value=settings["ai_base_url"], key="settings_ai_base_url",
-                                    placeholder="https://api.openai.com")
+                                    placeholder="https://generativelanguage.googleapis.com/v1beta/openai/")
         ai_api_key = st.text_input("API key", value=settings["ai_api_key"], type="password", key="settings_ai_api_key")
         model_cache_key = f"settings_available_models_{ai_base_url}"
         models = st.session_state.get(model_cache_key, [])
