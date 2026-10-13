@@ -133,13 +133,23 @@ def _request_analysis(system: str, user: str, *, base_url: str, model: str, api_
         with urllib.request.urlopen(request, timeout=600) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        response_text = exc.read(8000).decode("utf-8", errors="replace").strip()
         try:
-            body = json.loads(exc.read().decode("utf-8", errors="replace"))
+            body = json.loads(response_text)
             error = body.get("error", {}) if isinstance(body, dict) else {}
             detail = error.get("message", "") if isinstance(error, dict) else str(error)
+            if not detail and isinstance(body, dict):
+                detail = str(body.get("message", ""))
             error_code = str(error.get("code", "") or error.get("type", "")).casefold() if isinstance(error, dict) else ""
         except (json.JSONDecodeError, OSError):
-            detail, error_code = "", ""
+            detail, error_code = response_text, ""
+        if exc.code == 403:
+            guidance = (
+                "For a Google AI Studio key, verify in AI Studio that the key's project has Gemini API access, "
+                "the key is active and permitted for the Gemini API, and the selected model is available to that project. "
+                "A 403 is a permission denial; retrying without changing access will not fix it."
+            )
+            raise AIAnalysisError(f"AI provider denied access (HTTP 403). {detail} {guidance}".strip()) from exc
         if exc.code == 429 and ("quota" in error_code or "billing" in error_code or "quota" in detail.casefold()):
             raise AIAnalysisError(
                 f"The AI provider reports that this API account has no available quota or billing is not enabled. "
