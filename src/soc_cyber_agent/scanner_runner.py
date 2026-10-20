@@ -428,6 +428,16 @@ def _free_local_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _local_port_available(port: int) -> bool:
+    """Check whether ZAP's configured default proxy port is currently free."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
+
+
 def run_scan(
     scanner: str,
     target: str,
@@ -548,7 +558,7 @@ def run_scan(
         if not wordlist_path.is_file():
             raise ScannerError("Choose an existing local wordlist file for Gobuster.")
         raw_path = raw_dir / f"{job_id}-gobuster.txt"
-        args = [executable, "dir", "-u", target, "-w", str(wordlist_path.resolve()), "-t", "2" if vm_safe else "10", "-q", "-o", str(raw_path)]
+        args = [executable, "dir", "-u", target, "-w", str(wordlist_path.resolve()), "-t", "2" if vm_safe else "10", "--timeout", "30s", "-q", "-o", str(raw_path)]
         # A wildcard response means unknown paths resemble valid resources.
         # Gobuster reports the measured body length; retry once with that exact
         # length excluded rather than turning the false positives into results.
@@ -619,6 +629,24 @@ def run_scan(
         completed = _run(zap_args, timeout=3600, allow_nonzero=True,
                          control_check=control_check, env=zap_env,
                          on_progress=on_progress, progress_label=scanner, log_path=zap_log)
+        output = completed.stdout or ""
+        # Some Kali packages ship without the ZAP Network add-on CLI options.
+        # Their wrapper rejects -port before starting a scan; retry with ZAP's
+        # default listener only when it is free, keeping the first attempt's
+        # randomized port behavior for current installations.
+        if completed.returncode != 0 and re.search(r"unsupported option ['\"]?-port", output, re.IGNORECASE):
+            if not _local_port_available(8080):
+                raise ScannerError(
+                    "This ZAP installation does not recognize -port (usually a missing/outdated Network add-on), "
+                    "and its default proxy port 8080 is already occupied. Update ZAP's Network add-on or free port 8080, then retry. "
+                    f"Full output saved to raw/{zap_log.name}. Last output:\n{output[-8000:]}"
+                )
+            fallback_args = [arg for index, arg in enumerate(zap_args)
+                             if not (arg == "-port" or (index > 0 and zap_args[index - 1] == "-port"))]
+            completed = _run(fallback_args, timeout=3600, allow_nonzero=True,
+                             control_check=control_check, env=zap_env,
+                             on_progress=on_progress, progress_label=scanner, log_path=zap_log)
+            proxy_port = 8080
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "No output from ZAP.").strip()
             raise ScannerError(f"ZAP exited with code {completed.returncode} using proxy port {proxy_port}. Full output saved to raw/{zap_log.name}. Last output:\n{detail[-8000:]}")
