@@ -2,8 +2,7 @@
 
 A local security assessment dashboard that runs installed scanners, combines
 their findings, optionally asks an AI endpoint to explain results, and exports
-HTML or PDF reports. The application is Python-based and runs on Linux and
-Windows.
+HTML or PDF reports. The application is Python-based and runs on Linux 
 
 ## Linux development setup
 
